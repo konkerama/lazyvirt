@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -17,12 +18,20 @@ const histLen = 400
 type (
 	tickMsg time.Time
 	snapMsg struct {
-		vms []VM
-		at  time.Time
-		err error
+		vms  []VM
+		at   time.Time
+		err  error
+		tick bool // from the tick loop: schedules the next tick
+		host Host // zero when there is no host source
 	}
-	actMsg  struct{ err error }
-	infoMsg struct {
+	storageMsg struct {
+		pools []Pool
+		nets  []Net
+		err   error
+	}
+	actMsg   struct{ err error }
+	eventMsg struct{} // a domain changed state (libvirt lifecycle event)
+	infoMsg  struct {
 		key, text string
 		err       error
 	}
@@ -33,7 +42,12 @@ type model struct {
 	act      func(uuid, action string) error
 	details  func(uuid string) (string, error)
 	ip       func(uuid string) (string, error) // for the s shell key
-	uri      string                            // libvirt URI: ssh jump host, virsh console
+	host     func() (Host, error)              // optional: host capacity panel
+	storage  func() ([]Pool, []Net, error)     // optional: host view pools/networks
+	snaps    func(uuid string) ([]Snapshot, error)
+	snapDo   func(uuid, op, name string) (string, error)
+	events   <-chan struct{} // optional: lifecycle events for instant refresh
+	uri      string          // libvirt URI: ssh jump host, virsh console
 	sshUser  string
 	prefix   string
 	interval time.Duration
@@ -45,11 +59,21 @@ type model struct {
 	hist   map[string][]Rates
 	info   map[string]string // details text by UUID
 
-	confirm string // pending action awaiting y/n
-	gsel    string // selected group name
-	gvm     string // UUID of the VM highlighted inside it
-	gfocus  int    // 0 groups panel focused (group charts), 1 vms panel (VM charts)
+	hostNow  Host
+	hostHist []HostSample
+	pools    []Pool
+	nets     []Net
+
+	snapOpen bool // snapshots panel replaces the io charts (vms panel focused)
+	snapList []Snapshot
+	snapCur  int
+
+	confirm pending // action awaiting y/n; zero value = none
+	gsel    string  // selected group name
+	gvm     string  // UUID of the VM highlighted inside it
+	gfocus  int     // focusGroups, focusVMs or focusHost: which sidebar panel drives the charts
 	status  string
+	actErr  error // from something the user did; kept across refreshes
 	err     error
 
 	width, height int
@@ -61,12 +85,31 @@ func newModel(fetch func() ([]VM, error), act func(uuid, action string) error,
 		prev: map[string]VM{}, rates: map[string]Rates{}, hist: map[string][]Rates{}, info: map[string]string{}}
 }
 
-func (m model) Init() tea.Cmd { return m.fetchCmd() }
+func (m model) Init() tea.Cmd { return tea.Batch(m.fetchCmd(true), m.waitEvent()) }
 
-func (m model) fetchCmd() tea.Cmd {
+// waitEvent blocks off the UI goroutine until the next lifecycle event.
+func (m model) waitEvent() tea.Cmd {
+	if m.events == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		if _, ok := <-m.events; !ok {
+			return nil
+		}
+		return eventMsg{}
+	}
+}
+
+// fetchCmd refreshes all stats. Only the tick loop passes tick=true; extra
+// refreshes (after an action, R, an event) must not start a second loop.
+func (m model) fetchCmd(tick bool) tea.Cmd {
 	return func() tea.Msg {
 		vms, err := m.fetch()
-		return snapMsg{vms: vms, at: time.Now(), err: err}
+		msg := snapMsg{vms: vms, at: time.Now(), err: err, tick: tick}
+		if m.host != nil {
+			msg.host, _ = m.host() // a host stats hiccup must not hide the VMs
+		}
+		return msg
 	}
 }
 
@@ -92,18 +135,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case tickMsg:
-		return m, m.fetchCmd()
+		return m, m.fetchCmd(true)
+	case eventMsg:
+		return m, tea.Batch(m.fetchCmd(false), m.waitEvent())
 	case snapMsg:
 		m.err = msg.err
 		if msg.err == nil {
 			m.applySnap(msg.vms, msg.at)
 		}
+		if msg.host.CPUs > 0 {
+			m.applyHost(msg.host)
+		}
+		cmds := []tea.Cmd{m.infoCmd(true), m.storageCmd()}
 		// Next fetch is scheduled only after this one lands, so a slow
 		// hypervisor never piles up requests.
-		return m, tea.Batch(m.tickCmd(), m.infoCmd(true))
+		if msg.tick {
+			cmds = append(cmds, m.tickCmd())
+		}
+		return m, tea.Batch(cmds...)
+	case snapsMsg:
+		if msg.err != nil {
+			m.actErr = msg.err
+		} else if msg.uuid == m.target().UUID {
+			m.snapList = msg.list
+			m.snapCur = min(m.snapCur, max(len(msg.list)-1, 0))
+		}
+	case snapDoneMsg:
+		m.actErr, m.status = msg.err, ""
+		if msg.err == nil {
+			m.status = fmt.Sprintf("snapshot %s: %s", msg.op, msg.name)
+		}
+		// Revert can change the VM's state; refresh both.
+		return m, tea.Batch(m.snapsCmd(), m.fetchCmd(false))
+	case storageMsg:
+		if msg.err == nil {
+			m.pools, m.nets = msg.pools, msg.nets
+		}
 	case actMsg:
-		m.err = msg.err
-		return m, m.fetchCmd()
+		m.actErr = msg.err
+		return m, m.fetchCmd(false)
 	case shellMsg:
 		return m, execShell(msg.name, msg.argv, msg.ssh)
 	case shellDoneMsg:
@@ -146,24 +216,56 @@ func (m *model) applySnap(vms []VM, at time.Time) {
 	m.prev, m.prevAt, m.all = next, at, vms
 }
 
-var actionKeys = map[string]string{"u": "start", "S": "shutdown", "r": "reboot", "F": "destroy"}
+var (
+	actionKeys  = map[string]string{"u": "start", "S": "shutdown", "r": "reboot", "F": "destroy"}
+	actionVerbs = map[string]string{"start": "start", "shutdown": "shut down", "reboot": "reboot", "destroy": "force off"}
+)
+
+// Sidebar panels, in tab order.
+const (
+	focusGroups = iota
+	focusVMs
+	focusHost
+)
+
+// pending is an action waiting for y/n, with the VMs it will hit.
+type pending struct {
+	action, prompt string
+	vms            []VM
+	snap           string // snapshot name for snap-revert / snap-delete
+}
 
 func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	s := k.String()
-	if m.confirm != "" {
-		a := m.confirm
-		m.confirm = ""
+	m.actErr = nil // shown until the next key, so a refresh can't hide it
+	if c := m.confirm; c.action != "" {
+		m.confirm = pending{}
 		if s == "y" {
-			return m, m.actCmd(a)
+			if op, ok := strings.CutPrefix(c.action, "snap-"); ok {
+				return m, m.snapDoCmd(op, c.snap)
+			}
+			return m, m.actCmd(c.action, c.vms)
 		}
 		m.status = "cancelled"
 		return m, nil
 	}
 	if s == "R" {
-		return m, m.fetchCmd()
+		return m, m.fetchCmd(false)
 	}
-	prev := m.target().UUID
+	if m.snapOpen && m.gfocus == focusVMs {
+		if next, cmd, ok := m.snapKey(s); ok {
+			return next, cmd
+		}
+	}
+	prev, prevFocus := m.target().UUID, m.gfocus
 	tm, cmd := m.groupKey(s)
+	if next := tm.(model); next.gfocus != focusVMs && next.snapOpen {
+		next.snapOpen = false // the panel belongs to the selected VM
+		tm = next
+	}
+	if next := tm.(model); next.gfocus == focusHost && prevFocus != focusHost {
+		return next, tea.Batch(cmd, next.storageCmd()) // fill the host view now, not next tick
+	}
 	if next := tm.(model); next.target().UUID != prev {
 		// A new selection loads its info panel unless already cached.
 		return next, tea.Batch(cmd, next.infoCmd(false))
@@ -180,10 +282,27 @@ func (m model) target() VM {
 	return VM{}
 }
 
-func (m *model) actCmd(action string) tea.Cmd {
-	v := m.target()
-	m.status = action + " " + v.Name
-	return func() tea.Msg { return actMsg{err: m.act(v.UUID, action)} }
+// actCmd runs action on each VM in turn, off the UI goroutine, and reports
+// every failure (one stuck VM must not hide the others).
+func (m *model) actCmd(action string, vms []VM) tea.Cmd {
+	m.status = actionVerbs[action] + " " + vmNames(vms)
+	act := m.act
+	return func() tea.Msg {
+		var errs []error
+		for _, v := range vms {
+			if err := act(v.UUID, action); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", v.Name, err))
+			}
+		}
+		return actMsg{err: errors.Join(errs...)}
+	}
+}
+
+func vmNames(vms []VM) string {
+	if len(vms) == 1 {
+		return vms[0].Name
+	}
+	return fmt.Sprintf("%d VMs", len(vms))
 }
 
 // --- view -----------------------------------------------------------------
@@ -264,13 +383,27 @@ func series(hist []Rates, f func(Rates) float64) []float64 {
 
 func (m model) footer() string {
 	switch {
-	case m.confirm != "":
-		return " " + errStyle.Render(fmt.Sprintf("force off %s? (y/n)", m.target().Name))
+	case m.confirm.action != "":
+		return " " + errStyle.Render(m.confirm.prompt)
+	case m.actErr != nil:
+		return " " + errStyle.Render("error: "+m.actErr.Error())
 	case m.err != nil:
 		return " " + errStyle.Render("error: "+m.err.Error())
 	}
-	keys := [][2]string{{"j/k", "move"}, {"tab", "groups/vms"}, {"s", "shell"}, {"u", "start"}, {"S", "shutdown"},
+	keys := [][2]string{{"j/k", "move"}, {"tab", "panel"}, {"s", "shell"}, {"u", "start"}, {"S", "shutdown"},
 		{"r", "reboot"}, {"F", "force off"}, {"q", "quit"}}
+	if m.gfocus == focusHost {
+		keys = [][2]string{{"tab", "panel"}, {"R", "refresh"}, {"q", "quit"}}
+	}
+	if m.gfocus == focusVMs && m.snapOpen {
+		keys = [][2]string{{"j/k", "snapshot"}, {"n", "new"}, {"enter", "revert"}, {"d", "delete"}, {"p", "close"}, {"q", "quit"}}
+	} else if m.gfocus == focusVMs {
+		keys = append(keys[:len(keys)-1], [2]string{"p", "snapshots"}, [2]string{"q", "quit"})
+	}
+	if m.gfocus == focusGroups { // VM keys act on the whole group here
+		keys = [][2]string{{"j/k", "move"}, {"tab", "panel"}, {"u", "start group"}, {"S", "shutdown group"},
+			{"r", "reboot group"}, {"F", "force off group"}, {"q", "quit"}}
+	}
 	var b strings.Builder
 	for _, k := range keys {
 		b.WriteString(" " + fg(colAccent).Bold(true).Render(k[0]) + " " + dim.Render(k[1]) + " ")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/digitalocean/go-libvirt"
 )
@@ -21,8 +23,10 @@ type conn struct {
 	mu  sync.Mutex
 	l   *libvirt.Libvirt
 
-	memPeriod int32            // balloon stats period (s) set on running VMs
-	memStats  map[string]int32 // UUID -> domain ID (new per boot) already asked
+	memPeriod            int32 // balloon stats period (s) set on running VMs
+	hostInfo             Host  // static node info, read once
+	cpuParams, memParams int32
+	memStats             map[string]int32 // UUID -> domain ID (new per boot) already asked
 }
 
 func dial(raw string) (*conn, error) {
@@ -47,6 +51,34 @@ func (c *conn) get() (*libvirt.Libvirt, error) {
 	}
 	c.l = l
 	return l, nil
+}
+
+// events delivers a signal whenever any domain changes lifecycle state
+// (started, stopped, paused...), so the UI refreshes at once instead of on the
+// next tick. Bursts coalesce: the channel holds one pending signal. The
+// subscription is re-made after the connection drops.
+func (c *conn) events() <-chan struct{} {
+	out := make(chan struct{}, 1)
+	go func() {
+		for {
+			l, err := c.get()
+			var ch <-chan libvirt.DomainEventLifecycleMsg
+			if err == nil {
+				ch, err = l.LifecycleEvents(context.Background())
+			}
+			if err != nil {
+				time.Sleep(2 * time.Second) // libvirtd down; the tick shows the error
+				continue
+			}
+			for range ch {
+				select {
+				case out <- struct{}{}:
+				default: // one already pending
+				}
+			}
+		}
+	}()
+	return out
 }
 
 func (c *conn) close() {

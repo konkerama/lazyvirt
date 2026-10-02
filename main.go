@@ -26,6 +26,8 @@ func main() {
 
 	m := newModel(c.snapshot, c.act, c.details, *prefix, *interval)
 	m.ip, m.uri, m.sshUser = c.ip, *uri, *sshUser
+	m.host, m.storage, m.snaps, m.snapDo = c.host, c.storage, c.snapshots, c.snapshotDo
+	m.events = c.events()
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "lazyvirt:", err)
 		os.Exit(1)

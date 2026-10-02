@@ -86,3 +86,28 @@ func TestDrawOrderPutsSelectionLast(t *testing.T) {
 		t.Errorf("drawOrder(3,-1) = %v", got)
 	}
 }
+
+func TestGroupTargets(t *testing.T) {
+	vms := []VM{
+		{UUID: "a", State: StateRunning}, {UUID: "b", State: StateShutoff},
+		{UUID: "c", State: StatePaused}, {UUID: "d", State: StateCrashed},
+	}
+	ids := func(vs []VM) []string {
+		var out []string
+		for _, v := range vs {
+			out = append(out, v.UUID)
+		}
+		return out
+	}
+	cases := map[string][]string{
+		"start":    {"b", "d"},
+		"shutdown": {"a"},
+		"reboot":   {"a"},
+		"destroy":  {"a", "c", "d"},
+	}
+	for action, want := range cases {
+		if got := ids(groupTargets(vms, action)); !slices.Equal(got, want) {
+			t.Errorf("%s: got %v, want %v", action, got, want)
+		}
+	}
+}

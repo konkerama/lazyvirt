@@ -76,3 +76,14 @@ func TestParseUUIDRoundTrip(t *testing.T) {
 		t.Fatal("want error for bad uuid")
 	}
 }
+
+func TestParseSnapshotXML(t *testing.T) {
+	got, err := parseSnapshot(`<domainsnapshot><name>pre-upgrade</name><state>running</state>
+<creationTime>1790967244</creationTime><memory snapshot='internal'/></domainsnapshot>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "pre-upgrade" || got.State != "running" || got.Created.Unix() != 1790967244 {
+		t.Errorf("got %+v", got)
+	}
+}

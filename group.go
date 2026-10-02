@@ -171,20 +171,25 @@ func (m model) groupNav() (groups []Group, gi, vi int) {
 // VM is kept across group changes when the new group contains it.
 func (m model) groupKey(s string) (tea.Model, tea.Cmd) {
 	groups, gi, vi := m.groupNav()
-	focusVMs := m.gfocus == 1
+	vmsFocused := m.gfocus == focusVMs
 	move := func(i, n, d int) int { return min(max(i+d, 0), max(n-1, 0)) }
 	switch s {
 	case "q", "ctrl+c":
 		return m, tea.Quit
-	case "tab", "shift+tab", "h", "l", "left", "right":
-		m.gfocus = 1 - m.gfocus
+	case "tab", "l", "right":
+		m.gfocus = (m.gfocus + 1) % 3
+	case "shift+tab", "h", "left":
+		m.gfocus = (m.gfocus + 2) % 3
 	case "enter":
-		m.gfocus = 1
+		m.gfocus = focusVMs
 	case "esc":
-		m.gfocus = 0
+		m.gfocus = focusGroups
 	case "j", "down", "k", "up", "g", "home", "G", "end":
+		if m.gfocus == focusHost {
+			return m, nil
+		}
 		d := map[string]int{"j": 1, "down": 1, "k": -1, "up": -1, "g": -1 << 30, "home": -1 << 30, "G": 1 << 30, "end": 1 << 30}[s]
-		if focusVMs {
+		if vmsFocused {
 			vi = move(vi, len(groups[gi].VMs), d)
 		} else {
 			gi = move(gi, len(groups), d)
@@ -192,28 +197,65 @@ func (m model) groupKey(s string) (tea.Model, tea.Cmd) {
 			vi = max(slices.IndexFunc(groups[gi].VMs, func(v VM) bool { return v.UUID == m.gvm }), 0)
 		}
 	default:
-		_, isAction := actionKeys[s]
-		if !isAction && s != "s" {
-			return m, nil
-		}
-		if !focusVMs {
-			m.status = "tab to the vms panel to pick a VM"
-			return m, nil
-		}
-		if s == "s" {
+		action, isAction := actionKeys[s]
+		switch {
+		case s == "s" && vmsFocused:
 			return m, m.shellCmd()
+		case s == "p" && vmsFocused:
+			m.snapOpen, m.snapList, m.snapCur = true, nil, 0
+			return m, m.snapsCmd()
+		case s == "p":
+			m.status = "tab to the vms panel to pick a VM"
+		case s == "s", isAction && m.gfocus == focusHost:
+			m.status = "tab to the vms panel to pick a VM"
+		case !isAction:
+		case vmsFocused:
+			v := m.target()
+			if v.UUID == "" {
+				return m, nil
+			}
+			if action != "destroy" {
+				return m, m.actCmd(action, []VM{v})
+			}
+			m.confirm = pending{action: action, prompt: fmt.Sprintf("force off %s? (y/n)", v.Name), vms: []VM{v}}
+		default: // groups panel: the whole group, always confirmed
+			g := groups[gi]
+			vms := groupTargets(g.VMs, action)
+			if len(vms) == 0 {
+				m.status = fmt.Sprintf("nothing to %s in %s", actionVerbs[action], g.Name)
+				return m, nil
+			}
+			plural := "s"
+			if len(vms) == 1 {
+				plural = ""
+			}
+			m.confirm = pending{action: action, prompt: fmt.Sprintf("%s %d VM%s in %s? (y/n)", actionVerbs[action], len(vms), plural, g.Name), vms: vms}
 		}
-		if actionKeys[s] == "destroy" {
-			m.confirm = "destroy"
-			return m, nil
-		}
-		return m, m.actCmd(actionKeys[s])
+		return m, nil
 	}
 	m.gsel, m.gvm = groups[gi].Name, ""
 	if vms := groups[gi].VMs; len(vms) > 0 {
 		m.gvm = vms[vi].UUID
 	}
 	return m, nil
+}
+
+// groupTargets keeps the VMs an action applies to, so a group start skips
+// running VMs instead of failing on them.
+func groupTargets(vms []VM, action string) []VM {
+	ok := map[string]func(State) bool{
+		"start":    func(s State) bool { return s == StateShutoff || s == StateCrashed },
+		"shutdown": func(s State) bool { return s == StateRunning },
+		"reboot":   func(s State) bool { return s == StateRunning },
+		"destroy":  func(s State) bool { return s == StateRunning || s == StatePaused || s == StateCrashed },
+	}[action]
+	var out []VM
+	for _, v := range vms {
+		if ok != nil && ok(v.State) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // drawOrder lists series indexes with sel last, so the selected VM's line is
@@ -287,7 +329,7 @@ func (m model) groupView(h int) string {
 		}
 		cnt := fmt.Sprintf("%2d vm", len(gr.VMs))
 		if i == cur {
-			glines = append(glines, pick(m.gfocus == 0,
+			glines = append(glines, pick(m.gfocus == focusGroups,
 				fmt.Sprintf("▶ %-*s %s %s %5.1f%%", nameW, trunc(gr.Name, nameW), cnt, ansi.Strip(gauge(avg, 5)), avg)))
 			continue
 		}
@@ -295,7 +337,7 @@ func (m model) groupView(h int) string {
 			trunc(gr.Name, nameW), dim.Render(cnt), gauge(avg, 5), avg))
 	}
 	glines = glines[scrollStart(len(glines), cur, gh-2):]
-	gpanel := panel("groups", dim.Render(fmt.Sprint(len(groups))), glines, leftW, gh, border(m.gfocus == 0))
+	gpanel := panel("groups", dim.Render(fmt.Sprint(len(groups))), glines, leftW, gh, border(m.gfocus == focusGroups))
 
 	// VMs panel: the selected group's members with chart color and state.
 	vmW := max(inner-20, 6) // row: 3 lead, swatch 2, state 9, cpu 7
@@ -307,7 +349,7 @@ func (m model) groupView(h int) string {
 		}
 		name := trunc(shortName(v.Name, g.Name), vmW)
 		if j == vcur {
-			vlines = append(vlines, pick(m.gfocus == 1, fmt.Sprintf("▶ ━ %-*s %-8s %6s", vmW, name, v.State, cpu)))
+			vlines = append(vlines, pick(m.gfocus == focusVMs, fmt.Sprintf("▶ ━ %-*s %-8s %6s", vmW, name, v.State, cpu)))
 			continue
 		}
 		vlines = append(vlines, fmt.Sprintf("   %s %-*s %s %6s",
@@ -319,9 +361,10 @@ func (m model) groupView(h int) string {
 	}
 	// Info panel: fixed height at the bottom, always the selected VM.
 	ih := min(max(h/3, 6), 14)
-	vh := h - gh - ih
+	const hh = 6 // host panel: 4 gauge lines
+	vh := h - gh - ih - hh
 	vlines = vlines[scrollStart(len(vlines), vcur, vh-2):]
-	vpanel := panel("vms", dim.Render(g.Name), vlines, leftW, vh, border(m.gfocus == 1))
+	vpanel := panel("vms", dim.Render(g.Name), vlines, leftW, vh, border(m.gfocus == focusVMs))
 	sel := m.target()
 	var ilines []string
 	if sel.UUID != "" {
@@ -330,7 +373,7 @@ func (m model) groupView(h int) string {
 		}
 	}
 	ipanel := panel("info", dim.Render(shortName(sel.Name, g.Name)), ilines, leftW, ih, colBorder)
-	left := gpanel + "\n" + vpanel + "\n" + ipanel
+	left := gpanel + "\n" + vpanel + "\n" + ipanel + "\n" + m.hostPanel(leftW, hh, border(m.gfocus == focusHost))
 
 	// Header: group name + color legend shared by every chart.
 	legend := ""
@@ -350,7 +393,7 @@ func (m model) groupView(h int) string {
 		legend += st.Render(label) + "  "
 	}
 	head := " " + titleStyle.Render(g.Name) + dim.Render(fmt.Sprintf("  %d vms   ", len(g.VMs))) + legend
-	vmFocus := m.gfocus == 1 && sel.UUID != ""
+	vmFocus := m.gfocus == focusVMs && sel.UUID != ""
 	if vmFocus {
 		head = " " + fg(seriesColors[vcur%len(seriesColors)]).Render("━ ") + titleStyle.Render(sel.Name) + "  " +
 			fg(cmp.Or(stateColor[sel.State], colDim)).Render(sel.State.String()) + dim.Render("   "+g.Name+"   "+sel.UUID)
@@ -449,8 +492,15 @@ func (m model) groupView(h int) string {
 		if i == 4 {
 			rh = h - 1 - 2*ph // last row takes the remainder
 		}
+		if i == 2 && vmFocus && m.snapOpen { // snapshots take rows 2-3
+			rows = append(rows, m.snapPanel(rightW, h-1-ph))
+			break
+		}
 		rows = append(rows, hjoin(chart(metrics[i], colW, rh), chart(metrics[i+1], rightW-colW, rh)))
 	}
 	right := header + "\n" + strings.Join(rows, "\n")
+	if m.gfocus == focusHost {
+		right = m.hostView(rightW, h, ph)
+	}
 	return hjoin(left, right) + "\n" + m.footer()
 }

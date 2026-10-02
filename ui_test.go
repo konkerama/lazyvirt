@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"os/exec"
 	"slices"
@@ -155,21 +156,45 @@ func TestForceOffNeedsConfirm(t *testing.T) {
 	}
 }
 
-func TestActionsNeedVMsPanelFocus(t *testing.T) {
-	var calls []call
-	m := groupModel(t, 140, 40)
-	m.act = func(uuid, action string) error { calls = append(calls, call{uuid, action}); return nil }
-	m, cmd := send(m, key("u"), key("F"), key("y")) // groups panel focused
+func TestShellNeedsVMsPanelFocus(t *testing.T) {
+	m, cmd := send(groupModel(t, 140, 40), key("s")) // groups panel focused
 	if cmd != nil {
-		if msg := cmd(); msg != nil {
-			t.Errorf("unexpected command result %T", msg)
-		}
-	}
-	if len(calls) != 0 {
-		t.Errorf("actions ran with the groups panel focused: %v", calls)
+		t.Errorf("shell started with the groups panel focused")
 	}
 	if !strings.Contains(m.status, "tab") {
 		t.Errorf("status should hint how to pick a VM, got %q", m.status)
+	}
+}
+
+func TestGroupActionsConfirmAndTargetApplicableVMs(t *testing.T) {
+	var calls []call
+	m := groupModel(t, 140, 40) // "all": 3 running + win11 shutoff
+	m.act = func(uuid, action string) error { calls = append(calls, call{uuid, action}); return nil }
+
+	m, cmd := send(m, key("u"))
+	if cmd != nil || !strings.Contains(m.View(), "start 1 VM in all? (y/n)") {
+		t.Fatalf("u should ask first:\n%s", m.View())
+	}
+	m, cmd = send(m, key("y"))
+	msgsOf(cmd)
+	if !slices.Equal(calls, []call{{"u-x", "start"}}) {
+		t.Fatalf("calls %v, want start of the stopped VM only", calls)
+	}
+
+	calls = nil
+	m, _ = send(m, key("S"))
+	if !strings.Contains(m.View(), "shut down 3 VMs in all? (y/n)") {
+		t.Fatalf("missing shutdown prompt:\n%s", m.View())
+	}
+	m, cmd = send(m, key("n"))
+	msgsOf(cmd)
+	if len(calls) != 0 {
+		t.Fatalf("n should cancel, got %v", calls)
+	}
+
+	m, _ = send(m, key("j"), key("u")) // talos-local: all running
+	if !strings.Contains(m.status, "nothing to start") {
+		t.Errorf("status %q, want nothing-to-do message", m.status)
 	}
 }
 
@@ -190,7 +215,7 @@ func TestPanelsFocusAndActions(t *testing.T) {
 		t.Fatalf("calls %v, want start u-w0", calls)
 	}
 	// Back to groups, pick talos-local: worker-0 is a member, so it stays selected.
-	m, _ = send(m, key("tab"), key("j"))
+	m, _ = send(m, key("esc"), key("j"))
 	if m.gsel != "talos-local" || m.target().UUID != "u-w0" {
 		t.Fatalf("gsel %q target %q, want talos-local/u-w0", m.gsel, m.target().UUID)
 	}
@@ -403,5 +428,231 @@ func BenchmarkView(b *testing.B) {
 	}
 	for b.Loop() {
 		_ = m.View()
+	}
+}
+
+// msgsOf runs cmd and any nested batch, returning every message produced.
+func msgsOf(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	if b, ok := msg.(tea.BatchMsg); ok {
+		var out []tea.Msg
+		for _, c := range b {
+			out = append(out, msgsOf(c)...)
+		}
+		return out
+	}
+	return []tea.Msg{msg}
+}
+
+func countTicks(msgs []tea.Msg) int {
+	n := 0
+	for _, m := range msgs {
+		if _, ok := m.(tickMsg); ok {
+			n++
+		}
+	}
+	return n
+}
+
+func TestOnlyTickSnapshotsScheduleTheNextTick(t *testing.T) {
+	var calls []call
+	m := newTestModel(&calls)
+	// An action's follow-up refresh must not start a second refresh loop.
+	_, cmd := send(m, actMsg{})
+	var snap tea.Msg
+	for _, msg := range msgsOf(cmd) {
+		if s, ok := msg.(snapMsg); ok {
+			snap = s
+		}
+	}
+	if snap == nil {
+		t.Fatal("actMsg should refresh")
+	}
+	if _, cmd = send(m, snap); countTicks(msgsOf(cmd)) != 0 {
+		t.Error("refresh after an action scheduled another tick loop")
+	}
+	// The tick loop itself keeps going.
+	_, cmd = send(m, tickMsg(time.Now()))
+	tickSnap := msgsOf(cmd)[0]
+	if _, cmd = send(m, tickSnap); countTicks(msgsOf(cmd)) != 1 {
+		t.Error("tick refresh should schedule exactly one next tick")
+	}
+}
+
+// hostModel is groupModel with a host and storage source attached.
+func hostModel(t *testing.T) model {
+	t.Helper()
+	busy := uint64(0)
+	m := newTestModel(new([]call))
+	m.width, m.height = 160, 44
+	m.host = func() (Host, error) {
+		busy += 50
+		return Host{Name: "pc", Model: "x86_64", CPUs: 12, MemKiB: 32 << 20, AvailKiB: 16 << 20, CPUBusy: busy, CPUTotal: busy * 4}, nil
+	}
+	m.storage = func() ([]Pool, []Net, error) {
+		return []Pool{{Name: "talos-local", Active: true, Capacity: 100 << 30, Allocation: 45 << 30}},
+			[]Net{{Name: "talos-local-net", Bridge: "virbr1", Active: true,
+				Leases: []Lease{{IP: "192.168.150.11", MAC: "52:54:00:6c:61:0b", Hostname: "worker-0"}}}}, nil
+	}
+	for range 3 {
+		m = runAll(m, m.fetchCmd(false))
+	}
+	m, _ = send(m, snapMsg{vms: []VM{
+		{UUID: "u-cp", Name: "talos-local-cp", State: StateRunning, VCPUs: 2, MaxMemKiB: 4 << 20},
+		{UUID: "u-w0", Name: "talos-local-worker-0", State: StateRunning, VCPUs: 4, MaxMemKiB: 6 << 20},
+	}, at: time.Now()})
+	return m
+}
+
+func TestHostPanelShowsCapacity(t *testing.T) {
+	m := hostModel(t)
+	side := strings.Join(sidebarRows(m), "\n")
+	for _, want := range []string{"─ host", "pc", "25%", "16.0G / 32.0G", "6 / 12", "10.0G / 32.0G"} {
+		if !strings.Contains(side, want) {
+			t.Errorf("host panel missing %q:\n%s", want, side)
+		}
+	}
+}
+
+func TestHostFocusShowsPoolsAndNetworks(t *testing.T) {
+	m := hostModel(t)
+	n, cmd := send(m, key("tab"), key("tab"))
+	if n.gfocus != 2 {
+		t.Fatalf("focus %d, want host (2)", n.gfocus)
+	}
+	n = runAll(n, cmd)
+	v := ansi.Strip(n.View())
+	for _, want := range []string{"pools", "talos-local", "45%", "networks", "virbr1", "192.168.150.11", "worker-0"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("host view missing %q", want)
+		}
+	}
+	// Same grid as the other focuses: cpu row, then pools where disk read was.
+	if a, b := lineOf(m, "─ cpu"), lineOf(n, "─ cpu"); a != b {
+		t.Errorf("cpu chart moved: line %d vs %d", a, b)
+	}
+	if a, b := lineOf(m, "─ disk read"), lineOf(n, "─ pools"); a != b {
+		t.Errorf("pools panel at line %d, disk read was at %d", b, a)
+	}
+	if _, c := send(n, key("u")); c != nil {
+		t.Error("VM keys must do nothing with the host panel focused")
+	}
+}
+
+type snapCall struct{ uuid, op, name string }
+
+// snapModel is groupModel with the vms panel focused and a fake snapshot store.
+func snapModel(t *testing.T) (model, *[]snapCall) {
+	t.Helper()
+	calls := &[]snapCall{}
+	m := groupModel(t, 140, 40)
+	m.snaps = func(uuid string) ([]Snapshot, error) {
+		return []Snapshot{
+			{Name: "s1", State: "running", Created: time.Unix(1790000000, 0)},
+			{Name: "s2", State: "shutoff", Created: time.Unix(1790100000, 0), Current: true},
+		}, nil
+	}
+	m.snapDo = func(uuid, op, name string) (string, error) {
+		*calls = append(*calls, snapCall{uuid, op, name})
+		return cmp.Or(name, "lazyvirt-new"), nil
+	}
+	m, _ = send(m, key("tab")) // vms panel, talos-local-cp selected
+	return m, calls
+}
+
+func TestSnapshotsPanelOpensInPlaceOfIOCharts(t *testing.T) {
+	m, _ := snapModel(t)
+	before := lineOf(m, "─ disk read")
+	m, cmd := send(m, key("p"))
+	m = runAll(m, cmd)
+	v := ansi.Strip(m.View())
+	for _, want := range []string{"s1", "s2", "current", "─ cpu"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("snapshot view missing %q", want)
+		}
+	}
+	if got := lineOf(m, "─ snapshots"); got != before {
+		t.Errorf("snapshots panel at line %d, disk read was at %d", got, before)
+	}
+	if m, _ = send(m, key("p")); lineOf(m, "─ snapshots") >= 0 {
+		t.Error("p should close the snapshots panel")
+	}
+}
+
+func TestSnapshotCreateRevertDelete(t *testing.T) {
+	m, calls := snapModel(t)
+	m, cmd := send(m, key("p"))
+	m = runAll(m, cmd)
+
+	m, cmd = send(m, key("n")) // create: no prompt
+	m = runAll(m, cmd)
+	if len(*calls) != 1 || (*calls)[0] != (snapCall{"u-cp", "create", ""}) {
+		t.Fatalf("calls %v, want create", *calls)
+	}
+
+	m, _ = send(m, key("enter")) // s1 selected
+	if !strings.Contains(m.View(), "revert talos-local-cp to s1? (y/n)") {
+		t.Fatalf("missing revert prompt:\n%s", m.View())
+	}
+	m, cmd = send(m, key("y"))
+	m = runAll(m, cmd)
+	if (*calls)[1] != (snapCall{"u-cp", "revert", "s1"}) {
+		t.Fatalf("calls %v, want revert s1", *calls)
+	}
+
+	m, _ = send(m, key("j"), key("d"))
+	if !strings.Contains(m.View(), "delete snapshot s2 of talos-local-cp? (y/n)") {
+		t.Fatalf("missing delete prompt:\n%s", m.View())
+	}
+	m, cmd = send(m, key("n"))
+	m = runAll(m, cmd)
+	if len(*calls) != 2 {
+		t.Fatalf("n should cancel delete, calls %v", *calls)
+	}
+}
+
+func TestActionErrorSurvivesTheFollowUpRefresh(t *testing.T) {
+	var calls []call
+	m, _ := send(newTestModel(&calls), snapMsg{vms: threeVMs, at: time.Now()})
+	m, _ = send(m, actMsg{err: fmt.Errorf("worker-0: domain is already running")})
+	m, _ = send(m, snapMsg{vms: threeVMs, at: time.Now()}) // the refresh actMsg triggers
+	if !strings.Contains(m.View(), "already running") {
+		t.Fatalf("action error wiped by refresh:\n%s", strings.Split(m.View(), "\n")[m.height-1])
+	}
+	m, _ = send(m, snapDoneMsg{op: "create", err: fmt.Errorf("internal snapshot for disk vdb unsupported for storage type raw")})
+	m, _ = send(m, snapMsg{vms: threeVMs, at: time.Now()})
+	if !strings.Contains(m.View(), "storage type raw") {
+		t.Fatal("snapshot error wiped by refresh")
+	}
+	m, _ = send(m, key("j")) // the next keypress dismisses it
+	if strings.Contains(m.View(), "storage type raw") {
+		t.Error("error should clear on the next key")
+	}
+}
+
+func TestLifecycleEventRefreshesAndRearms(t *testing.T) {
+	var calls []call
+	m := newTestModel(&calls)
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{} // the next event, already queued
+	m.events = ch
+	_, cmd := send(m, eventMsg{})
+	var snaps, events int
+	for _, msg := range msgsOf(cmd) {
+		switch msg := msg.(type) {
+		case snapMsg:
+			snaps++
+			if msg.tick {
+				t.Error("event refresh must not start a tick loop")
+			}
+		case eventMsg:
+			events++
+		}
+	}
+	if snaps != 1 || events != 1 {
+		t.Fatalf("got %d refreshes and %d re-armed events, want 1 and 1", snaps, events)
 	}
 }

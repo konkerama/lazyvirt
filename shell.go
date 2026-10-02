@@ -93,7 +93,7 @@ func (m model) shellDone(msg shellDoneMsg) (model, tea.Cmd) {
 		return m, execShell(msg.name, consoleArgv(m.uri, msg.name), false)
 	}
 	if msg.err != nil && !errors.As(msg.err, &exit) {
-		m.err = msg.err // could not even start ssh/virsh
+		m.actErr = msg.err // could not even start ssh/virsh
 	}
 	return m, nil
 }
