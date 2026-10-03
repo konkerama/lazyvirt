@@ -1,4 +1,4 @@
-package main
+package ui
 
 import (
 	"cmp"
@@ -12,13 +12,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/konkerama/lazyvirt/internal/virt"
 )
 
 type call struct{ uuid, action string }
 
 func newTestModel(calls *[]call) model {
 	m := newModel(
-		func() ([]VM, error) { return nil, nil },
+		func() ([]virt.VM, error) { return nil, nil },
 		func(uuid, action string) error { *calls = append(*calls, call{uuid, action}); return nil },
 		func(uuid string) (string, error) { return "info for " + uuid, nil },
 		"", time.Millisecond,
@@ -67,10 +68,10 @@ func runAll(m model, cmd tea.Cmd) model {
 	return m
 }
 
-var threeVMs = []VM{
-	{UUID: "u-cp", Name: "talos-local-cp", State: StateRunning, VCPUs: 2},
-	{UUID: "u-w0", Name: "talos-local-worker-0", State: StateRunning, VCPUs: 4},
-	{UUID: "u-w1", Name: "talos-local-worker-1", State: StateShutoff, VCPUs: 4},
+var threeVMs = []virt.VM{
+	{UUID: "u-cp", Name: "talos-local-cp", State: virt.StateRunning, VCPUs: 2},
+	{UUID: "u-w0", Name: "talos-local-worker-0", State: virt.StateRunning, VCPUs: 4},
+	{UUID: "u-w1", Name: "talos-local-worker-1", State: virt.StateShutoff, VCPUs: 4},
 }
 
 // groupModel has 4 snapshots of history: three talos VMs plus a stopped win11.
@@ -81,11 +82,11 @@ func groupModel(t testing.TB, w, h int) model {
 	m := newTestModel(&calls)
 	m.width, m.height = w, h
 	for i := range uint64(4) {
-		vms := []VM{
-			{UUID: "u-cp", Name: "talos-local-cp", State: StateRunning, VCPUs: 1, CPUTime: i * 1e8, MaxMemKiB: 1 << 20, RSSKiB: 1 << 18},
-			{UUID: "u-w0", Name: "talos-local-worker-0", State: StateRunning, VCPUs: 1, CPUTime: i * 6e8, RdBytes: i << 20},
-			{UUID: "u-w1", Name: "talos-local-worker-1", State: StateRunning, VCPUs: 1, CPUTime: i * 3e8, RxBytes: i << 10},
-			{UUID: "u-x", Name: "win11", State: StateShutoff},
+		vms := []virt.VM{
+			{UUID: "u-cp", Name: "talos-local-cp", State: virt.StateRunning, VCPUs: 1, CPUTime: i * 1e8, MaxMemKiB: 1 << 20, RSSKiB: 1 << 18},
+			{UUID: "u-w0", Name: "talos-local-worker-0", State: virt.StateRunning, VCPUs: 1, CPUTime: i * 6e8, RdBytes: i << 20},
+			{UUID: "u-w1", Name: "talos-local-worker-1", State: virt.StateRunning, VCPUs: 1, CPUTime: i * 3e8, RxBytes: i << 10},
+			{UUID: "u-x", Name: "win11", State: virt.StateShutoff},
 		}
 		m, _ = send(m, snapMsg{vms: vms, at: t0.Add(time.Duration(i) * time.Second)})
 	}
@@ -115,7 +116,7 @@ func TestSelectionFollowsUUIDAcrossRefresh(t *testing.T) {
 	if got := m.target().UUID; got != "u-w1" {
 		t.Fatalf("selected %q after jj, want u-w1", got)
 	}
-	reordered := []VM{threeVMs[2], threeVMs[0], threeVMs[1]}
+	reordered := []virt.VM{threeVMs[2], threeVMs[0], threeVMs[1]}
 	m, _ = send(m, snapMsg{vms: reordered, at: time.Now()})
 	if got := m.target().UUID; got != "u-w1" {
 		t.Fatalf("selected %q after reorder, want u-w1", got)
@@ -125,8 +126,8 @@ func TestSelectionFollowsUUIDAcrossRefresh(t *testing.T) {
 func TestRatesFromConsecutiveSnapshots(t *testing.T) {
 	var calls []call
 	t0 := time.Now()
-	a := []VM{{UUID: "u", Name: "vm", State: StateRunning, VCPUs: 1, CPUTime: 0}}
-	b := []VM{{UUID: "u", Name: "vm", State: StateRunning, VCPUs: 1, CPUTime: 5e8}}
+	a := []virt.VM{{UUID: "u", Name: "vm", State: virt.StateRunning, VCPUs: 1, CPUTime: 0}}
+	b := []virt.VM{{UUID: "u", Name: "vm", State: virt.StateRunning, VCPUs: 1, CPUTime: 5e8}}
 	m, _ := send(newTestModel(&calls), snapMsg{vms: a, at: t0}, snapMsg{vms: b, at: t0.Add(time.Second)})
 	if got := m.rates["u"].CPU; got != 50 {
 		t.Fatalf("cpu = %v, want 50", got)
@@ -349,9 +350,9 @@ func TestVMsPanelScrollsToSelection(t *testing.T) {
 	var calls []call
 	m := newTestModel(&calls)
 	m.width, m.height = 120, 20
-	var vms []VM
+	var vms []virt.VM
 	for i := range 20 {
-		vms = append(vms, VM{UUID: fmt.Sprint(i), Name: fmt.Sprintf("node-%02d", i), State: StateRunning})
+		vms = append(vms, virt.VM{UUID: fmt.Sprint(i), Name: fmt.Sprintf("node-%02d", i), State: virt.StateRunning})
 	}
 	m, _ = send(m, snapMsg{vms: vms, at: time.Now()}, key("tab"), key("G"))
 	if !strings.Contains(strings.Join(sidebarRows(m), "\n"), "node-19") {
@@ -419,9 +420,9 @@ func BenchmarkView(b *testing.B) {
 	m.width, m.height = 200, 60
 	t0 := time.Now()
 	for i := range uint64(histLen) {
-		var vms []VM
+		var vms []virt.VM
 		for j := range uint64(8) {
-			vms = append(vms, VM{UUID: fmt.Sprint(j), Name: fmt.Sprintf("talos-local-worker-%d", j), State: StateRunning,
+			vms = append(vms, virt.VM{UUID: fmt.Sprint(j), Name: fmt.Sprintf("talos-local-worker-%d", j), State: virt.StateRunning,
 				VCPUs: 1, MaxMemKiB: 1 << 20, RSSKiB: (i * j) << 8, CPUTime: i * i * j * 1e5, RdBytes: i * i * j << 8, RxBytes: i * j})
 		}
 		m, _ = send(m, snapMsg{vms: vms, at: t0.Add(time.Duration(i) * time.Second)})
@@ -488,21 +489,21 @@ func hostModel(t *testing.T) model {
 	busy := uint64(0)
 	m := newTestModel(new([]call))
 	m.width, m.height = 160, 44
-	m.host = func() (Host, error) {
+	m.host = func() (virt.Host, error) {
 		busy += 50
-		return Host{Name: "pc", Model: "x86_64", CPUs: 12, MemKiB: 32 << 20, AvailKiB: 16 << 20, CPUBusy: busy, CPUTotal: busy * 4}, nil
+		return virt.Host{Name: "pc", Model: "x86_64", CPUs: 12, MemKiB: 32 << 20, AvailKiB: 16 << 20, CPUBusy: busy, CPUTotal: busy * 4}, nil
 	}
-	m.storage = func() ([]Pool, []Net, error) {
-		return []Pool{{Name: "talos-local", Active: true, Capacity: 100 << 30, Allocation: 45 << 30}},
-			[]Net{{Name: "talos-local-net", Bridge: "virbr1", Active: true,
-				Leases: []Lease{{IP: "192.168.150.11", MAC: "52:54:00:6c:61:0b", Hostname: "worker-0"}}}}, nil
+	m.storage = func() ([]virt.Pool, []virt.Net, error) {
+		return []virt.Pool{{Name: "talos-local", Active: true, Capacity: 100 << 30, Allocation: 45 << 30}},
+			[]virt.Net{{Name: "talos-local-net", Bridge: "virbr1", Active: true,
+				Leases: []virt.Lease{{IP: "192.168.150.11", MAC: "52:54:00:6c:61:0b", Hostname: "worker-0"}}}}, nil
 	}
 	for range 3 {
 		m = runAll(m, m.fetchCmd(false))
 	}
-	m, _ = send(m, snapMsg{vms: []VM{
-		{UUID: "u-cp", Name: "talos-local-cp", State: StateRunning, VCPUs: 2, MaxMemKiB: 4 << 20},
-		{UUID: "u-w0", Name: "talos-local-worker-0", State: StateRunning, VCPUs: 4, MaxMemKiB: 6 << 20},
+	m, _ = send(m, snapMsg{vms: []virt.VM{
+		{UUID: "u-cp", Name: "talos-local-cp", State: virt.StateRunning, VCPUs: 2, MaxMemKiB: 4 << 20},
+		{UUID: "u-w0", Name: "talos-local-worker-0", State: virt.StateRunning, VCPUs: 4, MaxMemKiB: 6 << 20},
 	}, at: time.Now()})
 	return m
 }
@@ -549,8 +550,8 @@ func snapModel(t *testing.T) (model, *[]snapCall) {
 	t.Helper()
 	calls := &[]snapCall{}
 	m := groupModel(t, 140, 40)
-	m.snaps = func(uuid string) ([]Snapshot, error) {
-		return []Snapshot{
+	m.snaps = func(uuid string) ([]virt.Snapshot, error) {
+		return []virt.Snapshot{
 			{Name: "s1", State: "running", Created: time.Unix(1790000000, 0)},
 			{Name: "s2", State: "shutoff", Created: time.Unix(1790100000, 0), Current: true},
 		}, nil
@@ -654,5 +655,22 @@ func TestLifecycleEventRefreshesAndRearms(t *testing.T) {
 	}
 	if snaps != 1 || events != 1 {
 		t.Fatalf("got %d refreshes and %d re-armed events, want 1 and 1", snaps, events)
+	}
+}
+
+func TestFilterVMs(t *testing.T) {
+	vms := []virt.VM{{Name: "talos-local-cp"}, {Name: "talos-local-worker-0"}, {Name: "win11"}, {Name: "other-talos-local-x"}}
+	names := func(vs []virt.VM) []string {
+		var out []string
+		for _, v := range vs {
+			out = append(out, v.Name)
+		}
+		return out
+	}
+	if got := names(filterVMs(vms, "talos-local")); !slices.Equal(got, []string{"talos-local-cp", "talos-local-worker-0"}) {
+		t.Errorf("prefix: %v", got)
+	}
+	if got := names(filterVMs(vms, "")); len(got) != 4 {
+		t.Errorf("no prefix: %v", got)
 	}
 }

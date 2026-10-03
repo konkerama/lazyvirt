@@ -1,7 +1,7 @@
 //go:build integration
 
 // Needs a running libvirt with the VMs from `make vms-up`.
-package main
+package virt
 
 import (
 	"strings"
@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-func findVM(t *testing.T, c *conn, name string) VM {
+func findVM(t *testing.T, c *Conn, name string) VM {
 	t.Helper()
-	vms, err := c.snapshot()
+	vms, err := c.Domains()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +24,7 @@ func findVM(t *testing.T, c *conn, name string) VM {
 	return VM{}
 }
 
-func waitState(t *testing.T, c *conn, name string, want State) {
+func waitState(t *testing.T, c *Conn, name string, want State) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -37,16 +37,16 @@ func waitState(t *testing.T, c *conn, name string, want State) {
 }
 
 func TestIntegrationSnapshotAndDetails(t *testing.T) {
-	c, err := dial("qemu:///system")
+	c, err := Dial("qemu:///system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.close()
+	defer c.Close()
 	cp := findVM(t, c, "lazyvirt-test-cp")
 	if cp.State != StateRunning || cp.VCPUs != 1 || cp.MaxMemKiB == 0 {
 		t.Errorf("unexpected cp stats: %+v", cp)
 	}
-	info, err := c.details(findVM(t, c, "lazyvirt-test-worker-0").UUID)
+	info, err := c.Details(findVM(t, c, "lazyvirt-test-worker-0").UUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,29 +58,65 @@ func TestIntegrationSnapshotAndDetails(t *testing.T) {
 }
 
 func TestIntegrationForceOffAndStart(t *testing.T) {
-	c, err := dial("qemu:///system")
+	c, err := Dial("qemu:///system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.close()
+	defer c.Close()
 	const name = "lazyvirt-test-worker-1"
 	id := findVM(t, c, name).UUID
-	if err := c.act(id, "destroy"); err != nil {
+	if err := c.Act(id, "destroy"); err != nil {
 		t.Fatal(err)
 	}
 	waitState(t, c, name, StateShutoff)
-	if err := c.act(id, "start"); err != nil {
+	if err := c.Act(id, "start"); err != nil {
 		t.Fatal(err)
 	}
 	waitState(t, c, name, StateRunning)
 }
 
-func TestIntegrationGuestMemStatsGoFresh(t *testing.T) {
-	c, err := dial("qemu:///system")
+func TestIntegrationPauseResumeAndAutostart(t *testing.T) {
+	c, err := Dial("qemu:///system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.close()
+	defer c.Close()
+	const name = "lazyvirt-test-worker-1"
+	id := findVM(t, c, name).UUID
+	if err := c.Act(id, "suspend"); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c, name, StatePaused)
+	if err := c.Act(id, "resume"); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c, name, StateRunning)
+
+	autostart := func() string {
+		info, err := c.Details(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Fields(info[strings.Index(info, "Autostart"):])[1]
+	}
+	before := autostart()
+	for range 2 { // toggle twice: back where it started
+		if err := c.Act(id, "autostart"); err != nil {
+			t.Fatal(err)
+		}
+		if got := autostart(); got == before {
+			t.Fatalf("autostart still %s after toggle", got)
+		}
+		before = autostart()
+	}
+}
+
+func TestIntegrationGuestMemStatsGoFresh(t *testing.T) {
+	c, err := Dial("qemu:///system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
 	const name = "lazyvirt-test-cp"
 	first := findVM(t, c, name)
 	deadline := time.Now().Add(10 * time.Second)
@@ -94,28 +130,28 @@ func TestIntegrationGuestMemStatsGoFresh(t *testing.T) {
 }
 
 func TestIntegrationIP(t *testing.T) {
-	c, err := dial("qemu:///system")
+	c, err := Dial("qemu:///system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.close()
-	ip, err := c.ip(findVM(t, c, "lazyvirt-test-cp").UUID)
+	defer c.Close()
+	ip, err := c.IP(findVM(t, c, "lazyvirt-test-cp").UUID)
 	if err != nil || !strings.HasPrefix(ip, "192.168.160.") {
 		t.Fatalf("ip = %q, %v; want a 192.168.160.x lease", ip, err)
 	}
 }
 
 func TestIntegrationHostAndStorage(t *testing.T) {
-	c, err := dial("qemu:///system")
+	c, err := Dial("qemu:///system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.close()
-	h, err := c.host()
+	defer c.Close()
+	h, err := c.Host()
 	if err != nil || h.CPUs == 0 || h.MemKiB == 0 || h.AvailKiB == 0 || h.CPUTotal == 0 || h.Name == "" {
 		t.Fatalf("host = %+v, %v", h, err)
 	}
-	pools, nets, err := c.storage()
+	pools, nets, err := c.Storage()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,51 +176,51 @@ func TestIntegrationHostAndStorage(t *testing.T) {
 }
 
 func TestIntegrationSnapshotLifecycle(t *testing.T) {
-	c, err := dial("qemu:///system")
+	c, err := Dial("qemu:///system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.close()
+	defer c.Close()
 	cp := findVM(t, c, "lazyvirt-test-cp").UUID
-	name, err := c.snapshotDo(cp, "create", "")
+	name, err := c.SnapshotDo(cp, "create", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.snapshotDo(cp, "delete", name) // cleanup if a step below fails
-	snaps, err := c.snapshots(cp)
+	defer c.SnapshotDo(cp, "delete", name) // cleanup if a step below fails
+	snaps, err := c.Snapshots(cp)
 	if err != nil || len(snaps) == 0 || snaps[len(snaps)-1].Name != name || !snaps[len(snaps)-1].Current {
 		t.Fatalf("snapshots = %+v, %v; want %s last and current", snaps, err, name)
 	}
-	if _, err := c.snapshotDo(cp, "revert", name); err != nil {
+	if _, err := c.SnapshotDo(cp, "revert", name); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.snapshotDo(cp, "delete", name); err != nil {
+	if _, err := c.SnapshotDo(cp, "delete", name); err != nil {
 		t.Fatal(err)
 	}
-	if snaps, _ = c.snapshots(cp); len(snaps) != 0 {
+	if snaps, _ = c.Snapshots(cp); len(snaps) != 0 {
 		t.Fatalf("snapshot not deleted: %+v", snaps)
 	}
 	// Raw disks can't be snapshotted internally: the error must say so.
 	w := findVM(t, c, "lazyvirt-test-worker-0").UUID
-	if _, err := c.snapshotDo(w, "create", ""); err == nil || !strings.Contains(err.Error(), "raw") {
+	if _, err := c.SnapshotDo(w, "create", ""); err == nil || !strings.Contains(err.Error(), "raw") {
 		t.Fatalf("worker with raw disk: err = %v, want a raw-disk error", err)
 	}
 }
 
 func TestIntegrationLifecycleEvents(t *testing.T) {
-	c, err := dial("qemu:///system")
+	c, err := Dial("qemu:///system")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.close()
-	ev := c.events()
+	defer c.Close()
+	ev := c.Events()
 	const name = "lazyvirt-test-worker-1"
 	id := findVM(t, c, name).UUID
 	time.Sleep(300 * time.Millisecond) // let the subscription register
-	if err := c.act(id, "destroy"); err != nil {
+	if err := c.Act(id, "destroy"); err != nil {
 		t.Fatal(err)
 	}
-	defer c.act(id, "start")
+	defer c.Act(id, "start")
 	select {
 	case <-ev:
 	case <-time.After(5 * time.Second):

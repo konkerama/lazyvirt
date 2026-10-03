@@ -1,4 +1,4 @@
-package main
+package virt
 
 import (
 	"cmp"
@@ -16,30 +16,30 @@ import (
 	"github.com/digitalocean/go-libvirt"
 )
 
-// conn wraps one libvirt connection and re-dials after it drops
+// Conn wraps one libvirt connection and re-dials after it drops
 // (libvirtd restart, ssh blip).
-type conn struct {
+type Conn struct {
 	uri *url.URL
 	mu  sync.Mutex
 	l   *libvirt.Libvirt
 
-	memPeriod            int32 // balloon stats period (s) set on running VMs
+	MemPeriod            int32 // balloon stats period (s) set on running VMs
 	hostInfo             Host  // static node info, read once
 	cpuParams, memParams int32
 	memStats             map[string]int32 // UUID -> domain ID (new per boot) already asked
 }
 
-func dial(raw string) (*conn, error) {
+func Dial(raw string) (*Conn, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("bad URI %q: %w", raw, err)
 	}
-	c := &conn{uri: u, memPeriod: 2, memStats: map[string]int32{}}
+	c := &Conn{uri: u, MemPeriod: 2, memStats: map[string]int32{}}
 	_, err = c.get()
 	return c, err
 }
 
-func (c *conn) get() (*libvirt.Libvirt, error) {
+func (c *Conn) get() (*libvirt.Libvirt, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.l != nil && c.l.IsConnected() {
@@ -53,11 +53,11 @@ func (c *conn) get() (*libvirt.Libvirt, error) {
 	return l, nil
 }
 
-// events delivers a signal whenever any domain changes lifecycle state
+// Events delivers a signal whenever any domain changes lifecycle state
 // (started, stopped, paused...), so the UI refreshes at once instead of on the
 // next tick. Bursts coalesce: the channel holds one pending signal. The
 // subscription is re-made after the connection drops.
-func (c *conn) events() <-chan struct{} {
+func (c *Conn) Events() <-chan struct{} {
 	out := make(chan struct{}, 1)
 	go func() {
 		for {
@@ -81,7 +81,7 @@ func (c *conn) events() <-chan struct{} {
 	return out
 }
 
-func (c *conn) close() {
+func (c *Conn) Close() {
 	if c.l != nil {
 		_ = c.l.Disconnect()
 	}
@@ -90,8 +90,8 @@ func (c *conn) close() {
 const statsWanted = libvirt.DomainStatsState | libvirt.DomainStatsCPUTotal | libvirt.DomainStatsBalloon |
 	libvirt.DomainStatsVCPU | libvirt.DomainStatsInterface | libvirt.DomainStatsBlock
 
-// snapshot fetches every domain's stats in a single RPC.
-func (c *conn) snapshot() ([]VM, error) {
+// Domains fetches every domain's stats in a single RPC.
+func (c *Conn) Domains() ([]VM, error) {
 	l, err := c.get()
 	if err != nil {
 		return nil, err
@@ -115,7 +115,7 @@ func (c *conn) snapshot() ([]VM, error) {
 // the running qemu, never the saved config, and is gone after the VM stops;
 // the domain ID changes every boot, which is how a restart gets asked again.
 // Fails harmlessly for VMs without a virtio balloon; tried once either way.
-func (c *conn) enableMemStats(l *libvirt.Libvirt, d libvirt.Domain, v VM) {
+func (c *Conn) enableMemStats(l *libvirt.Libvirt, d libvirt.Domain, v VM) {
 	if v.State != StateRunning {
 		return
 	}
@@ -125,10 +125,10 @@ func (c *conn) enableMemStats(l *libvirt.Libvirt, d libvirt.Domain, v VM) {
 		return
 	}
 	c.memStats[v.UUID] = d.ID
-	_ = l.DomainSetMemoryStatsPeriod(d, c.memPeriod, libvirt.DomainMemLive)
+	_ = l.DomainSetMemoryStatsPeriod(d, c.MemPeriod, libvirt.DomainMemLive)
 }
 
-func (c *conn) lookup(uuid string) (*libvirt.Libvirt, libvirt.Domain, error) {
+func (c *Conn) lookup(uuid string) (*libvirt.Libvirt, libvirt.Domain, error) {
 	l, err := c.get()
 	if err != nil {
 		return nil, libvirt.Domain{}, err
@@ -151,7 +151,7 @@ func parseUUID(s string) (libvirt.UUID, error) {
 	return u, nil
 }
 
-func (c *conn) act(uuid, action string) error {
+func (c *Conn) Act(uuid, action string) error {
 	l, d, err := c.lookup(uuid)
 	if err != nil {
 		return err
@@ -165,11 +165,21 @@ func (c *conn) act(uuid, action string) error {
 		return l.DomainReboot(d, 0)
 	case "destroy":
 		return l.DomainDestroy(d)
+	case "suspend":
+		return l.DomainSuspend(d)
+	case "resume":
+		return l.DomainResume(d)
+	case "autostart": // toggle: starts with libvirtd, i.e. on host boot
+		on, err := l.DomainGetAutostart(d)
+		if err != nil {
+			return err
+		}
+		return l.DomainSetAutostart(d, 1-on)
 	}
 	return fmt.Errorf("unknown action %q", action)
 }
 
-func (c *conn) details(uuid string) (string, error) {
+func (c *Conn) Details(uuid string) (string, error) {
 	l, d, err := c.lookup(uuid)
 	if err != nil {
 		return "", err
@@ -185,8 +195,8 @@ func (c *conn) details(uuid string) (string, error) {
 	return formatInfo(desc, auto == 1, ifaces)
 }
 
-// ip returns the VM's first IPv4 DHCP lease, "" if it has none.
-func (c *conn) ip(uuid string) (string, error) {
+// IP returns the VM's first IPv4 DHCP lease, "" if it has none.
+func (c *Conn) IP(uuid string) (string, error) {
 	l, d, err := c.lookup(uuid)
 	if err != nil {
 		return "", err
@@ -263,7 +273,7 @@ func formatInfo(desc string, autostart bool, ifaces []libvirt.DomainInterface) (
 	yes := map[bool]string{true: "yes", false: "no"}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "vCPUs      %d\nMemory     %s\n", d.VCPU, humanBytes(float64(d.Memory)*1024))
+	fmt.Fprintf(&b, "vCPUs      %d\nMemory     %s\n", d.VCPU, HumanBytes(float64(d.Memory)*1024))
 	fmt.Fprintf(&b, "Machine    %s (%s)\nAutostart  %s\n", d.OS.Type.Machine, d.OS.Type.Arch, yes[autostart])
 	// Network first: the IP is what you look for, and the panel is short.
 	b.WriteString("\nNetwork\n")

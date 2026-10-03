@@ -1,4 +1,4 @@
-package main
+package virt
 
 import (
 	"fmt"
@@ -113,7 +113,7 @@ type Rates struct {
 	GuestMem            bool // MemKiB came from the guest, not host RSS
 }
 
-func computeRates(prev, cur VM, dt time.Duration) Rates {
+func ComputeRates(prev, cur VM, dt time.Duration) Rates {
 	secs := dt.Seconds()
 	if secs <= 0 {
 		return Rates{}
@@ -143,18 +143,7 @@ func computeRates(prev, cur VM, dt time.Duration) Rates {
 	return r
 }
 
-// filterVMs keeps VMs whose name starts with prefix.
-func filterVMs(vms []VM, prefix string) []VM {
-	out := make([]VM, 0, len(vms))
-	for _, v := range vms {
-		if strings.HasPrefix(v.Name, prefix) {
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
-func humanBytes(b float64) string {
+func HumanBytes(b float64) string {
 	if b < 1024 {
 		return fmt.Sprintf("%.0fB", b)
 	}

@@ -1,8 +1,11 @@
-package main
+package ui
 
 import (
 	"slices"
+	"strings"
 	"testing"
+
+	"github.com/konkerama/lazyvirt/internal/virt"
 )
 
 func TestGroupKey(t *testing.T) {
@@ -23,7 +26,7 @@ func TestGroupKey(t *testing.T) {
 }
 
 func TestBuildGroups(t *testing.T) {
-	vms := []VM{
+	vms := []virt.VM{
 		{UUID: "1", Name: "talos-local-cp"}, {UUID: "2", Name: "talos-local-worker-0"},
 		{UUID: "3", Name: "talos-local-worker-1"}, {UUID: "4", Name: "win11"},
 		{UUID: "5", Name: "lazyvirt-test-cp"}, {UUID: "6", Name: "lazyvirt-test-worker-0"},
@@ -51,30 +54,39 @@ func TestShortName(t *testing.T) {
 	}
 }
 
+func plotText(g [][]plotCell) string {
+	rows := make([]string, len(g))
+	for r, cells := range g {
+		for _, c := range cells {
+			if c.ch == 0 {
+				rows[r] += " "
+			} else {
+				rows[r] += string(c.ch)
+			}
+		}
+	}
+	return strings.Join(rows, "\n")
+}
+
 func TestPlotLines(t *testing.T) {
-	// One cell (2 samples wide, 4 dots tall), max 3 so each dot row is a level.
-	g := plotLines([][]float64{{3, 3}}, 3, 1, 1)
-	if g[0][0].bits != 0x01|0x08 || g[0][0].owner != 0 {
-		t.Errorf("flat max line: got %#x owner %d, want top dots 0x09", g[0][0].bits, g[0][0].owner)
+	// One sample per column, max 2 on 3 rows so each row is one level.
+	g := plotLines([][]float64{{0, 0, 2, 2, 0}}, 2, 5, 3)
+	want := "  ╭─╮\n  │ │\n──╯ ╰"
+	if got := plotText(g); got != want {
+		t.Errorf("line:\n%s\nwant:\n%s", got, want)
 	}
-	g = plotLines([][]float64{{0, 0}}, 3, 1, 1)
-	if g[0][0].bits != 0x40|0x80 {
-		t.Errorf("flat zero line: got %#x, want bottom dots 0xc0", g[0][0].bits)
+	if g[2][0].owner != 0 || g[0][0].owner != -1 {
+		t.Errorf("owners: drawn %d, empty %d", g[2][0].owner, g[0][0].owner)
 	}
-	// Rising 0 -> 3 connects vertically in the right column.
-	g = plotLines([][]float64{{0, 3}}, 3, 1, 1)
-	if want := rune(0x40 | 0x08 | 0x10 | 0x20 | 0x80); g[0][0].bits != want {
-		t.Errorf("rising line: got %#x, want %#x", g[0][0].bits, want)
+	// Later series wins where lines share a cell.
+	g = plotLines([][]float64{{0, 0}, {0, 2}}, 2, 2, 3)
+	if g[2][1].owner != 1 || g[2][1].ch != '╯' {
+		t.Errorf("collision: owner %d ch %q", g[2][1].owner, g[2][1].ch)
 	}
-	// Later series wins the cell's color where lines share a cell.
-	g = plotLines([][]float64{{0, 0}, {3, 3}}, 3, 1, 1)
-	if g[0][0].owner != 1 || g[0][0].bits != 0x01|0x08|0x40|0x80 {
-		t.Errorf("collision: owner %d bits %#x", g[0][0].owner, g[0][0].bits)
-	}
-	// Empty cells have no owner.
-	g = plotLines([][]float64{{3}}, 3, 2, 1)
-	if g[0][0].owner != -1 {
-		t.Errorf("padding cell owner %d, want -1", g[0][0].owner)
+	// Short history is right-aligned, padding cells stay empty.
+	g = plotLines([][]float64{{2}}, 2, 2, 1)
+	if g[0][0].owner != -1 || g[0][1].ch != '─' {
+		t.Errorf("padding: %q", plotText(g))
 	}
 }
 
@@ -88,11 +100,11 @@ func TestDrawOrderPutsSelectionLast(t *testing.T) {
 }
 
 func TestGroupTargets(t *testing.T) {
-	vms := []VM{
-		{UUID: "a", State: StateRunning}, {UUID: "b", State: StateShutoff},
-		{UUID: "c", State: StatePaused}, {UUID: "d", State: StateCrashed},
+	vms := []virt.VM{
+		{UUID: "a", State: virt.StateRunning}, {UUID: "b", State: virt.StateShutoff},
+		{UUID: "c", State: virt.StatePaused}, {UUID: "d", State: virt.StateCrashed},
 	}
-	ids := func(vs []VM) []string {
+	ids := func(vs []virt.VM) []string {
 		var out []string
 		for _, v := range vs {
 			out = append(out, v.UUID)

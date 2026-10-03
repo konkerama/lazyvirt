@@ -1,0 +1,41 @@
+name: release
+
+# Push a vX.Y.Z tag to publish stripped linux binaries. mise installs them
+# with `"github:konkerama/lazyvirt" = "latest"`.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write     # create the release
+  id-token: write     # sign the provenance attestation
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make test
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          mkdir dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o lazyvirt ./cmd/lazyvirt
+            # Go stamps the version from the tag; fail rather than ship "(devel)".
+            if [ "$arch" = amd64 ]; then ./lazyvirt --version | grep -Fx "lazyvirt $GITHUB_REF_NAME"; fi
+            tar -czf "dist/lazyvirt_${GITHUB_REF_NAME}_linux_${arch}.tar.gz" lazyvirt README.md
+          done
+          (cd dist && sha256sum -- *.tar.gz > checksums.txt)
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

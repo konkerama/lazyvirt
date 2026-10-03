@@ -1,4 +1,4 @@
-package main
+package ui
 
 import (
 	"errors"
@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/konkerama/lazyvirt/internal/virt"
 )
 
 type (
@@ -61,7 +62,7 @@ func (m *model) shellCmd() tea.Cmd {
 	if v.UUID == "" {
 		return nil
 	}
-	if v.State != StateRunning {
+	if v.State != virt.StateRunning {
 		m.status = v.Name + " is " + v.State.String()
 		return nil
 	}

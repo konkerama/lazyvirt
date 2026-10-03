@@ -14,12 +14,20 @@ POOL_DIR=/var/lib/libvirt/images/$P
 NET_CIDR_PREFIX=192.168.160
 CIRROS=0.6.2
 IMG_URL=https://download.cirros-cloud.net/$CIRROS/cirros-$CIRROS-x86_64-disk.img
+# Upstream only publishes MD5SUMS; this sha256 is of the file matching it.
+IMG_SHA256=07e44a73e54c94d988028515403c1ed762055e01b83a767edf3c2b387f78ce00
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/lazyvirt/cirros-$CIRROS.img
 
 up() {
   local workers=${1:-2}
   mkdir -p "$(dirname "$CACHE")"
-  [[ -f $CACHE ]] || curl -fL --progress-bar -o "$CACHE" "$IMG_URL"
+  # Download beside the cache and move it in only once verified, so an
+  # interrupted or corrupt download is never mistaken for the image.
+  if ! echo "$IMG_SHA256  $CACHE" | sha256sum --check --status 2> /dev/null; then
+    curl -fL --progress-bar -o "$CACHE.part" "$IMG_URL"
+    echo "$IMG_SHA256  $CACHE.part" | sha256sum --check --quiet
+    mv "$CACHE.part" "$CACHE"
+  fi
 
   if ! virsh net-info $P-net &> /dev/null; then
     virsh net-define /dev/stdin <<XML
@@ -32,18 +40,22 @@ up() {
 </network>
 XML
   fi
-  virsh net-start $P-net 2> /dev/null || true
+  [[ $(virsh net-info $P-net) =~ Active:[[:space:]]+yes ]] || virsh net-start $P-net
 
   if ! virsh pool-info $P &> /dev/null; then
     virsh pool-define-as $P dir --target "$POOL_DIR"
     virsh pool-build $P
   fi
-  virsh pool-start $P 2> /dev/null || true
+  [[ $(virsh pool-info $P) =~ State:[[:space:]]+running ]] || virsh pool-start $P
 
   # Base image uploaded once through libvirt, so qemu (not us) owns the file.
   if ! virsh vol-info base.qcow2 --pool $P &> /dev/null; then
     virsh vol-create-as $P base.qcow2 "$(stat -c %s "$CACHE")" --format qcow2
+    # A half-uploaded base would be reused forever: drop it unless the
+    # upload finishes (failure, Ctrl+C).
+    trap 'virsh vol-delete base.qcow2 --pool $P > /dev/null' EXIT
     virsh vol-upload base.qcow2 "$CACHE" --pool $P
+    trap - EXIT
   fi
 
   local names=("$P-cp")
@@ -51,14 +63,21 @@ XML
 
   for name in "${names[@]}"; do
     if virsh dominfo "$name" &> /dev/null; then
-      echo "$name exists"
+      case $(virsh domstate "$name") in
+        running) echo "$name running" ;;
+        paused) virsh resume "$name" > /dev/null && echo "$name resumed" ;;
+        *) virsh start "$name" > /dev/null && echo "$name started" ;;
+      esac
       continue
     fi
-    virsh vol-create-as $P "$name-boot.qcow2" 1G --format qcow2 \
-      --backing-vol base.qcow2 --backing-vol-format qcow2 > /dev/null
+    # Volumes can outlive their domain (undefined outside `down`); reuse them.
+    virsh vol-info "$name-boot.qcow2" --pool $P &> /dev/null ||
+      virsh vol-create-as $P "$name-boot.qcow2" 1G --format qcow2 \
+        --backing-vol base.qcow2 --backing-vol-format qcow2 > /dev/null
     local disks=(--disk "vol=$P/$name-boot.qcow2,bus=virtio")
     if [[ $name == *worker* ]]; then
-      virsh vol-create-as $P "$name-longhorn.raw" 256M --format raw > /dev/null
+      virsh vol-info "$name-longhorn.raw" --pool $P &> /dev/null ||
+        virsh vol-create-as $P "$name-longhorn.raw" 256M --format raw > /dev/null
       disks+=(--disk "vol=$P/$name-longhorn.raw,bus=virtio")
     fi
     virt-install --name "$name" --memory 128 --vcpus 1 --import \

@@ -1,4 +1,4 @@
-package main
+package ui
 
 import (
 	"cmp"
@@ -11,12 +11,13 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/konkerama/lazyvirt/internal/virt"
 )
 
 // Group is a set of VMs compared side by side in the groups view.
 type Group struct {
 	Name string
-	VMs  []VM
+	VMs  []virt.VM
 }
 
 // groupKey derives a VM's group from its name: drop a trailing number, then
@@ -35,8 +36,8 @@ func groupKey(name string) string {
 }
 
 // buildGroups returns "all" plus every prefix group with 2+ VMs, by name.
-func buildGroups(vms []VM) []Group {
-	by := map[string][]VM{}
+func buildGroups(vms []virt.VM) []Group {
+	by := map[string][]virt.VM{}
 	for _, v := range vms {
 		k := groupKey(v.Name)
 		by[k] = append(by[k], v)
@@ -60,19 +61,13 @@ func shortName(name, group string) string {
 }
 
 type plotCell struct {
-	bits  rune
-	owner int // index of the last series drawn here, -1 if empty
+	ch    rune // box-drawing glyph, 0 if empty
+	owner int  // index of the last series drawn here, -1 if empty
 }
 
-// Braille dot bits per column, top to bottom.
-var (
-	leftCol  = [4]rune{0x01, 0x02, 0x04, 0x40}
-	rightCol = [4]rune{0x08, 0x10, 0x20, 0x80}
-)
-
-// plotLines draws each series as a connected braille line on a shared
-// w x h grid scaled to maxV, newest sample at the right edge. Where series
-// cross, the later one owns the cell's color.
+// plotLines draws each series as a connected box-drawing line (lazydocker /
+// asciigraph style) on a shared w x h grid scaled to maxV, one sample per
+// column, newest at the right edge. Where series cross, the later one wins.
 func plotLines(series [][]float64, maxV float64, w, h int) [][]plotCell {
 	grid := make([][]plotCell, h)
 	for r := range grid {
@@ -81,34 +76,33 @@ func plotLines(series [][]float64, maxV float64, w, h int) [][]plotCell {
 			grid[r][c].owner = -1
 		}
 	}
-	dotsH := h * 4
-	level := func(v float64) int { // dot row from the top
+	row := func(v float64) int { // row from the top
 		if maxV <= 0 {
-			return dotsH - 1
+			return h - 1
 		}
-		y := int(math.Round(min(max(v, 0), maxV) / maxV * float64(dotsH-1)))
-		return dotsH - 1 - y
+		return h - 1 - int(math.Round(min(max(v, 0), maxV)/maxV*float64(h-1)))
 	}
 	for si, vals := range series {
-		if len(vals) > 2*w {
-			vals = vals[len(vals)-2*w:]
+		if len(vals) > w {
+			vals = vals[len(vals)-w:]
 		}
-		pad := 2*w - len(vals)
+		pad := w - len(vals)
+		set := func(y, x int, ch rune) { grid[y][x] = plotCell{ch, si} }
 		prev := -1
 		for i, v := range vals {
-			x, y := pad+i, level(v)
-			lo, hi := y, y
-			if prev >= 0 { // join to the previous sample with a vertical run
-				lo, hi = min(y, prev), max(y, prev)
+			x, y := pad+i, row(v)
+			switch {
+			case prev < 0 || prev == y:
+				set(y, x, '─')
+			case y < prev: // rising
+				set(prev, x, '╯')
+				set(y, x, '╭')
+			default: // falling
+				set(prev, x, '╮')
+				set(y, x, '╰')
 			}
-			col := &leftCol
-			if x%2 == 1 {
-				col = &rightCol
-			}
-			for yy := lo; yy <= hi; yy++ {
-				c := &grid[yy/4][x/2]
-				c.bits |= col[yy%4]
-				c.owner = si
+			for yy := min(y, prev) + 1; prev >= 0 && yy < max(y, prev); yy++ {
+				set(yy, x, '│')
 			}
 			prev = y
 		}
@@ -143,7 +137,11 @@ func renderPlot(grid [][]plotCell, colors []string) []string {
 				flush()
 				owner = c.owner
 			}
-			run = append(run, 0x2800+c.bits)
+			if c.ch == 0 {
+				run = append(run, ' ')
+			} else {
+				run = append(run, c.ch)
+			}
 		}
 		flush()
 		rows[r] = b.String()
@@ -159,9 +157,9 @@ var seriesColors = []string{"#7aa2f7", "#50f095", "#ff79c6", "#f2e266", "#ff9e64
 // groupNav is the groups view's selection: the selected group, the
 // highlighted VM inside it (always one when the group has VMs) and its index.
 func (m model) groupNav() (groups []Group, gi, vi int) {
-	groups = buildGroups(m.all)
+	groups = buildGroups(m.visible())
 	gi = max(slices.IndexFunc(groups, func(g Group) bool { return g.Name == m.gsel }), 0)
-	vi = max(slices.IndexFunc(groups[gi].VMs, func(v VM) bool { return v.UUID == m.gvm }), 0)
+	vi = max(slices.IndexFunc(groups[gi].VMs, func(v virt.VM) bool { return v.UUID == m.gvm }), 0)
 	return groups, gi, vi
 }
 
@@ -194,11 +192,25 @@ func (m model) groupKey(s string) (tea.Model, tea.Cmd) {
 		} else {
 			gi = move(gi, len(groups), d)
 			// Keep the VM if the new group has it, else start at the top.
-			vi = max(slices.IndexFunc(groups[gi].VMs, func(v VM) bool { return v.UUID == m.gvm }), 0)
+			vi = max(slices.IndexFunc(groups[gi].VMs, func(v virt.VM) bool { return v.UUID == m.gvm }), 0)
 		}
 	default:
 		action, isAction := actionKeys[s]
+		if s == "P" { // one key for both: what P does depends on state
+			action, isAction = "suspend", true
+			if vmsFocused && m.target().State == virt.StatePaused ||
+				!vmsFocused && len(groupTargets(groups[gi].VMs, "suspend")) == 0 {
+				action = "resume"
+			}
+		}
 		switch {
+		case s == "a" && vmsFocused:
+			if v := m.target(); v.UUID != "" {
+				return m, m.actCmd("autostart", []virt.VM{v})
+			}
+			return m, nil
+		case s == "a":
+			m.status = "tab to the vms panel to pick a VM"
 		case s == "s" && vmsFocused:
 			return m, m.shellCmd()
 		case s == "p" && vmsFocused:
@@ -215,9 +227,9 @@ func (m model) groupKey(s string) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if action != "destroy" {
-				return m, m.actCmd(action, []VM{v})
+				return m, m.actCmd(action, []virt.VM{v})
 			}
-			m.confirm = pending{action: action, prompt: fmt.Sprintf("force off %s? (y/n)", v.Name), vms: []VM{v}}
+			m.confirm = pending{action: action, prompt: fmt.Sprintf("force off %s? (y/n)", v.Name), vms: []virt.VM{v}}
 		default: // groups panel: the whole group, always confirmed
 			g := groups[gi]
 			vms := groupTargets(g.VMs, action)
@@ -242,14 +254,18 @@ func (m model) groupKey(s string) (tea.Model, tea.Cmd) {
 
 // groupTargets keeps the VMs an action applies to, so a group start skips
 // running VMs instead of failing on them.
-func groupTargets(vms []VM, action string) []VM {
-	ok := map[string]func(State) bool{
-		"start":    func(s State) bool { return s == StateShutoff || s == StateCrashed },
-		"shutdown": func(s State) bool { return s == StateRunning },
-		"reboot":   func(s State) bool { return s == StateRunning },
-		"destroy":  func(s State) bool { return s == StateRunning || s == StatePaused || s == StateCrashed },
+func groupTargets(vms []virt.VM, action string) []virt.VM {
+	ok := map[string]func(virt.State) bool{
+		"start":    func(s virt.State) bool { return s == virt.StateShutoff || s == virt.StateCrashed },
+		"shutdown": func(s virt.State) bool { return s == virt.StateRunning },
+		"reboot":   func(s virt.State) bool { return s == virt.StateRunning },
+		"destroy": func(s virt.State) bool {
+			return s == virt.StateRunning || s == virt.StatePaused || s == virt.StateCrashed
+		},
+		"suspend": func(s virt.State) bool { return s == virt.StateRunning },
+		"resume":  func(s virt.State) bool { return s == virt.StatePaused },
 	}[action]
-	var out []VM
+	var out []virt.VM
 	for _, v := range vms {
 		if ok != nil && ok(v.State) {
 			out = append(out, v)
@@ -318,7 +334,7 @@ func (m model) groupView(h int) string {
 	for i, gr := range groups {
 		sum, n := 0.0, 0
 		for _, v := range gr.VMs {
-			if v.State == StateRunning {
+			if v.State == virt.StateRunning {
 				sum += m.rates[v.UUID].CPU
 				n++
 			}
@@ -344,7 +360,7 @@ func (m model) groupView(h int) string {
 	var vlines []string
 	for j, v := range g.VMs {
 		cpu, swatch := "", colDim // stopped VMs draw no line
-		if v.State == StateRunning {
+		if v.State == virt.StateRunning {
 			cpu, swatch = fmt.Sprintf("%5.1f%%", m.rates[v.UUID].CPU), seriesColors[j%len(seriesColors)]
 		}
 		name := trunc(shortName(v.Name, g.Name), vmW)
@@ -379,11 +395,11 @@ func (m model) groupView(h int) string {
 	legend := ""
 	for i, v := range g.VMs {
 		c := seriesColors[i%len(seriesColors)]
-		if v.State != StateRunning {
+		if v.State != virt.StateRunning {
 			c = colDim
 		}
 		label := "● " + shortName(v.Name, g.Name)
-		if v.State != StateRunning {
+		if v.State != virt.StateRunning {
 			label += " (" + v.State.String() + ")"
 		}
 		st := fg(c)
@@ -401,7 +417,7 @@ func (m model) groupView(h int) string {
 	header := ansi.Truncate(head, rightW, "…")
 	header += strings.Repeat(" ", max(rightW-lipgloss.Width(header), 0))
 
-	pct := func(r Rates) float64 {
+	pct := func(r virt.Rates) float64 {
 		if r.MemTotalKiB == 0 {
 			return 0
 		}
@@ -409,28 +425,28 @@ func (m model) groupView(h int) string {
 	}
 	type metric struct {
 		name   string
-		f      func(Rates) float64
+		f      func(virt.Rates) float64
 		max    float64 // 0 = autoscale to the visible peak
 		format func(float64) string
-		detail func(Rates) string // title in VM focus; nil = format + visible peak
+		detail func(virt.Rates) string // title in VM focus; nil = format + visible peak
 	}
 	perc := func(x float64) string { return fmt.Sprintf("%.0f%%", x) }
-	rate := func(x float64) string { return humanBytes(x) + "/s" }
+	rate := func(x float64) string { return virt.HumanBytes(x) + "/s" }
 	metrics := []metric{
-		{"cpu", func(r Rates) float64 { return r.CPU }, 100, perc, func(r Rates) string {
+		{"cpu", func(r virt.Rates) float64 { return r.CPU }, 100, perc, func(r virt.Rates) string {
 			return fmt.Sprintf("%.1f%%", r.CPU) + dim.Render(fmt.Sprintf(" · %d vCPU", sel.VCPUs))
 		}},
-		{"mem", pct, 100, perc, func(r Rates) string {
+		{"mem", pct, 100, perc, func(r virt.Rates) string {
 			src := "host rss"
 			if r.GuestMem {
 				src = "guest"
 			}
-			return fmt.Sprintf("%.0f%%  %s / %s", pct(r), humanBytes(r.MemKiB*1024), humanBytes(r.MemTotalKiB*1024)) + dim.Render(" · "+src)
+			return fmt.Sprintf("%.0f%%  %s / %s", pct(r), virt.HumanBytes(r.MemKiB*1024), virt.HumanBytes(r.MemTotalKiB*1024)) + dim.Render(" · "+src)
 		}},
-		{"disk read", func(r Rates) float64 { return r.Rd }, 0, rate, nil},
-		{"disk write", func(r Rates) float64 { return r.Wr }, 0, rate, nil},
-		{"net rx", func(r Rates) float64 { return r.Rx }, 0, rate, nil},
-		{"net tx", func(r Rates) float64 { return r.Tx }, 0, rate, nil},
+		{"disk read", func(r virt.Rates) float64 { return r.Rd }, 0, rate, nil},
+		{"disk write", func(r virt.Rates) float64 { return r.Wr }, 0, rate, nil},
+		{"net rx", func(r virt.Rates) float64 { return r.Rx }, 0, rate, nil},
+		{"net tx", func(r virt.Rates) float64 { return r.Tx }, 0, rate, nil},
 	}
 
 	ph := (h - 1) / 3
@@ -447,11 +463,11 @@ func (m model) groupView(h int) string {
 		}
 		for _, i := range members {
 			v := g.VMs[i]
-			if v.State != StateRunning {
+			if v.State != virt.StateRunning {
 				continue
 			}
 			vals := series(m.hist[v.UUID], mt.f)
-			for _, x := range vals[max(len(vals)-2*gw, 0):] {
+			for _, x := range vals[max(len(vals)-gw, 0):] {
 				peak = max(peak, x)
 			}
 			lines = append(lines, vals)
@@ -460,7 +476,7 @@ func (m model) groupView(h int) string {
 		// Title values stay in member order so they don't shuffle as the
 		// selection moves; the selected one is bold.
 		for i, v := range g.VMs {
-			if v.State != StateRunning {
+			if v.State != virt.StateRunning {
 				continue
 			}
 			st := fg(seriesColors[i%len(seriesColors)])
@@ -475,7 +491,7 @@ func (m model) groupView(h int) string {
 		}
 		if vmFocus { // one VM: richer title instead of one value per VM
 			info = nil
-			if sel.State == StateRunning {
+			if sel.State == virt.StateRunning {
 				r := m.rates[sel.UUID]
 				t := mt.format(mt.f(r)) + dim.Render("  peak "+mt.format(peak))
 				if mt.detail != nil {

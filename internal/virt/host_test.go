@@ -1,4 +1,4 @@
-package main
+package virt
 
 import (
 	"testing"
@@ -26,16 +26,16 @@ func TestParseHostMem(t *testing.T) {
 
 func TestHostCPUPct(t *testing.T) {
 	prev := Host{CPUBusy: 100, CPUTotal: 1000}
-	if got := hostCPUPct(prev, Host{CPUBusy: 150, CPUTotal: 1200}); got != 25 {
+	if got := HostCPUPct(prev, Host{CPUBusy: 150, CPUTotal: 1200}); got != 25 {
 		t.Errorf("got %v, want 25", got)
 	}
-	if got := hostCPUPct(prev, prev); got != 0 {
+	if got := HostCPUPct(prev, prev); got != 0 {
 		t.Errorf("no time passed: got %v, want 0", got)
 	}
 }
 
 func TestAllocated(t *testing.T) {
-	vcpus, mem := allocated([]VM{
+	vcpus, mem := Allocated([]VM{
 		{State: StateRunning, VCPUs: 2, MaxMemKiB: 1000},
 		{State: StateRunning, VCPUs: 4, MaxMemKiB: 3000},
 		{State: StateShutoff, VCPUs: 8, MaxMemKiB: 9000}, // stopped: holds nothing

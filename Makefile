@@ -9,7 +9,7 @@ help: ## List targets
 		awk -F':.*##' '{printf "  \033[36m%-17s\033[0m %s\n", $$1, $$2}'
 
 build: ## Build ./lazyvirt
-	go build -trimpath -ldflags='-s -w' -o $(BIN) .
+	go build -trimpath -ldflags='-s -w' -o $(BIN) ./cmd/lazyvirt
 
 run: build ## Run against local libvirt (ARGS='-c qemu+ssh://host/system --prefix talos-local')
 	./$(BIN) $(ARGS)
@@ -27,7 +27,7 @@ vet: ## go vet
 	go vet ./...
 
 install: ## go install into $GOBIN / ~/go/bin
-	go install -trimpath -ldflags='-s -w' .
+	go install -trimpath -ldflags='-s -w' ./cmd/lazyvirt
 
 vms-up: ## Create lazyvirt-test-* cirros VMs (WORKERS=2)
 	scripts/test-vms.sh up $(WORKERS)

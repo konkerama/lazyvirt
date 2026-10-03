@@ -1,4 +1,4 @@
-package main
+package ui
 
 import (
 	"errors"
@@ -10,23 +10,24 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/konkerama/lazyvirt/internal/virt"
 )
 
-// histLen samples per VM: 2 per braille cell, enough for a ~200-column graph.
+// histLen samples per VM: one per column, enough for a ~400-column graph.
 const histLen = 400
 
 type (
 	tickMsg time.Time
 	snapMsg struct {
-		vms  []VM
+		vms  []virt.VM
 		at   time.Time
 		err  error
-		tick bool // from the tick loop: schedules the next tick
-		host Host // zero when there is no host source
+		tick bool      // from the tick loop: schedules the next tick
+		host virt.Host // zero when there is no host source
 	}
 	storageMsg struct {
-		pools []Pool
-		nets  []Net
+		pools []virt.Pool
+		nets  []virt.Net
 		err   error
 	}
 	actMsg   struct{ err error }
@@ -38,13 +39,13 @@ type (
 )
 
 type model struct {
-	fetch    func() ([]VM, error)
+	fetch    func() ([]virt.VM, error)
 	act      func(uuid, action string) error
 	details  func(uuid string) (string, error)
-	ip       func(uuid string) (string, error) // for the s shell key
-	host     func() (Host, error)              // optional: host capacity panel
-	storage  func() ([]Pool, []Net, error)     // optional: host view pools/networks
-	snaps    func(uuid string) ([]Snapshot, error)
+	ip       func(uuid string) (string, error)       // for the s shell key
+	host     func() (virt.Host, error)               // optional: host capacity panel
+	storage  func() ([]virt.Pool, []virt.Net, error) // optional: host view pools/networks
+	snaps    func(uuid string) ([]virt.Snapshot, error)
 	snapDo   func(uuid, op, name string) (string, error)
 	events   <-chan struct{} // optional: lifecycle events for instant refresh
 	uri      string          // libvirt URI: ssh jump host, virsh console
@@ -52,37 +53,50 @@ type model struct {
 	prefix   string
 	interval time.Duration
 
-	all    []VM // latest snapshot, prefix-filtered
-	prev   map[string]VM
+	all    []virt.VM // latest snapshot, prefix-filtered
+	prev   map[string]virt.VM
 	prevAt time.Time
-	rates  map[string]Rates
-	hist   map[string][]Rates
+	rates  map[string]virt.Rates
+	hist   map[string][]virt.Rates
 	info   map[string]string // details text by UUID
 
-	hostNow  Host
+	hostNow  virt.Host
 	hostHist []HostSample
-	pools    []Pool
-	nets     []Net
+	pools    []virt.Pool
+	nets     []virt.Net
 
 	snapOpen bool // snapshots panel replaces the io charts (vms panel focused)
-	snapList []Snapshot
+	snapList []virt.Snapshot
 	snapCur  int
 
 	confirm pending // action awaiting y/n; zero value = none
-	gsel    string  // selected group name
-	gvm     string  // UUID of the VM highlighted inside it
-	gfocus  int     // focusGroups, focusVMs or focusHost: which sidebar panel drives the charts
-	status  string
-	actErr  error // from something the user did; kept across refreshes
-	err     error
+	help    bool    // ? overlay; any key closes it
+	search  string  // / filter on VM names, case-insensitive
+	// searching: keys edit search until enter (keep) or esc (clear).
+	searching bool
+	gsel      string // selected group name
+	gvm       string // UUID of the VM highlighted inside it
+	gfocus    int    // focusGroups, focusVMs or focusHost: which sidebar panel drives the charts
+	status    string
+	actErr    error // from something the user did; kept across refreshes
+	err       error
 
 	width, height int
 }
 
-func newModel(fetch func() ([]VM, error), act func(uuid, action string) error,
+func newModel(fetch func() ([]virt.VM, error), act func(uuid, action string) error,
 	details func(uuid string) (string, error), prefix string, interval time.Duration) model {
 	return model{fetch: fetch, act: act, details: details, prefix: prefix, interval: interval,
-		prev: map[string]VM{}, rates: map[string]Rates{}, hist: map[string][]Rates{}, info: map[string]string{}}
+		prev: map[string]virt.VM{}, rates: map[string]virt.Rates{}, hist: map[string][]virt.Rates{}, info: map[string]string{}}
+}
+
+// New builds the UI on a libvirt connection. Tests use newModel with fakes.
+func New(c *virt.Conn, uri, prefix, sshUser string, interval time.Duration) tea.Model {
+	m := newModel(c.Domains, c.Act, c.Details, prefix, interval)
+	m.ip, m.uri, m.sshUser = c.IP, uri, sshUser
+	m.host, m.storage, m.snaps, m.snapDo = c.Host, c.Storage, c.Snapshots, c.SnapshotDo
+	m.events = c.Events()
+	return m
 }
 
 func (m model) Init() tea.Cmd { return tea.Batch(m.fetchCmd(true), m.waitEvent()) }
@@ -190,13 +204,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) applySnap(vms []VM, at time.Time) {
+func (m *model) applySnap(vms []virt.VM, at time.Time) {
 	vms = filterVMs(vms, m.prefix)
 	dt := at.Sub(m.prevAt)
-	next := make(map[string]VM, len(vms))
+	next := make(map[string]virt.VM, len(vms))
 	for _, v := range vms {
 		if p, ok := m.prev[v.UUID]; ok {
-			r := computeRates(p, v, dt)
+			r := virt.ComputeRates(p, v, dt)
 			m.rates[v.UUID] = r
 			h := append(m.hist[v.UUID], r)
 			if len(h) > histLen {
@@ -218,7 +232,8 @@ func (m *model) applySnap(vms []VM, at time.Time) {
 
 var (
 	actionKeys  = map[string]string{"u": "start", "S": "shutdown", "r": "reboot", "F": "destroy"}
-	actionVerbs = map[string]string{"start": "start", "shutdown": "shut down", "reboot": "reboot", "destroy": "force off"}
+	actionVerbs = map[string]string{"start": "start", "shutdown": "shut down", "reboot": "reboot", "destroy": "force off",
+		"suspend": "pause", "resume": "resume", "autostart": "toggle autostart of"}
 )
 
 // Sidebar panels, in tab order.
@@ -231,7 +246,7 @@ const (
 // pending is an action waiting for y/n, with the VMs it will hit.
 type pending struct {
 	action, prompt string
-	vms            []VM
+	vms            []virt.VM
 	snap           string // snapshot name for snap-revert / snap-delete
 }
 
@@ -249,8 +264,25 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.status = "cancelled"
 		return m, nil
 	}
-	if s == "R" {
+	if m.help {
+		m.help = false
+		return m, nil
+	}
+	if m.searching {
+		if s == "ctrl+c" {
+			return m, tea.Quit
+		}
+		return m.searchKey(k), nil
+	}
+	switch s {
+	case "R":
 		return m, m.fetchCmd(false)
+	case "?":
+		m.help = true
+		return m, nil
+	case "/":
+		m.searching = true
+		return m, nil
 	}
 	if m.snapOpen && m.gfocus == focusVMs {
 		if next, cmd, ok := m.snapKey(s); ok {
@@ -273,18 +305,52 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return tm, cmd
 }
 
+// searchKey edits the / filter. The selection follows by UUID, so a VM that
+// still matches stays selected.
+func (m model) searchKey(k tea.KeyMsg) model {
+	switch k.Type {
+	case tea.KeyEnter:
+		m.searching = false
+	case tea.KeyEsc:
+		m.searching, m.search = false, ""
+	case tea.KeyBackspace:
+		if r := []rune(m.search); len(r) > 0 {
+			m.search = string(r[:len(r)-1])
+		}
+	case tea.KeyRunes, tea.KeySpace:
+		m.search += string(k.Runes)
+	}
+	return m
+}
+
+// visible is the VMs the sidebar and charts show: all of them, narrowed by
+// the / search.
+func (m model) visible() []virt.VM {
+	if m.search == "" {
+		return m.all
+	}
+	q := strings.ToLower(m.search)
+	var out []virt.VM
+	for _, v := range m.all {
+		if strings.Contains(strings.ToLower(v.Name), q) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // target is the VM that action and shell keys apply to.
-func (m model) target() VM {
+func (m model) target() virt.VM {
 	groups, gi, vi := m.groupNav()
 	if vms := groups[gi].VMs; len(vms) > 0 {
 		return vms[vi]
 	}
-	return VM{}
+	return virt.VM{}
 }
 
 // actCmd runs action on each VM in turn, off the UI goroutine, and reports
 // every failure (one stuck VM must not hide the others).
-func (m *model) actCmd(action string, vms []VM) tea.Cmd {
+func (m *model) actCmd(action string, vms []virt.VM) tea.Cmd {
 	m.status = actionVerbs[action] + " " + vmNames(vms)
 	act := m.act
 	return func() tea.Msg {
@@ -298,7 +364,7 @@ func (m *model) actCmd(action string, vms []VM) tea.Cmd {
 	}
 }
 
-func vmNames(vms []VM) string {
+func vmNames(vms []virt.VM) string {
 	if len(vms) == 1 {
 		return vms[0].Name
 	}
@@ -332,7 +398,7 @@ var (
 	titleStyle = fg(colText).Bold(true)
 	selStyle   = lipgloss.NewStyle().Background(lipgloss.Color("#2f3549")).Foreground(lipgloss.Color(colText)).Bold(true)
 	errStyle   = fg(colCrashed).Bold(true)
-	stateColor = map[State]string{StateRunning: colRunning, StatePaused: colPaused, StateCrashed: colCrashed}
+	stateColor = map[virt.State]string{virt.StateRunning: colRunning, virt.StatePaused: colPaused, virt.StateCrashed: colCrashed}
 )
 
 func (m model) View() string {
@@ -342,6 +408,9 @@ func (m model) View() string {
 	h := m.height - 1 // footer
 	if h < 10 || m.width < 60 {
 		return "terminal too small"
+	}
+	if m.help {
+		return m.helpView()
 	}
 	return m.groupView(h)
 }
@@ -373,7 +442,7 @@ func gradAt(stops []string, t float64) string {
 }
 
 // series pulls one metric out of the history.
-func series(hist []Rates, f func(Rates) float64) []float64 {
+func series(hist []virt.Rates, f func(virt.Rates) float64) []float64 {
 	out := make([]float64, len(hist))
 	for i, r := range hist {
 		out[i] = f(r)
@@ -385,6 +454,8 @@ func (m model) footer() string {
 	switch {
 	case m.confirm.action != "":
 		return " " + errStyle.Render(m.confirm.prompt)
+	case m.searching:
+		return " " + fg(colAccent).Bold(true).Render("/"+m.search+"█") + dim.Render("  enter keep · esc clear")
 	case m.actErr != nil:
 		return " " + errStyle.Render("error: "+m.actErr.Error())
 	case m.err != nil:
@@ -404,7 +475,11 @@ func (m model) footer() string {
 		keys = [][2]string{{"j/k", "move"}, {"tab", "panel"}, {"u", "start group"}, {"S", "shutdown group"},
 			{"r", "reboot group"}, {"F", "force off group"}, {"q", "quit"}}
 	}
+	keys = append(keys[:len(keys)-1], [2]string{"?", "help"}, keys[len(keys)-1])
 	var b strings.Builder
+	if m.search != "" {
+		b.WriteString(" " + fg(colAccent).Bold(true).Render("/"+m.search) + " " + dim.Render("│"))
+	}
 	for _, k := range keys {
 		b.WriteString(" " + fg(colAccent).Bold(true).Render(k[0]) + " " + dim.Render(k[1]) + " ")
 	}
@@ -435,4 +510,46 @@ func hjoin(a, b string) string {
 		}
 	}
 	return strings.Join(al, "\n")
+}
+
+// filterVMs keeps VMs whose name starts with prefix.
+func filterVMs(vms []virt.VM, prefix string) []virt.VM {
+	out := make([]virt.VM, 0, len(vms))
+	for _, v := range vms {
+		if strings.HasPrefix(v.Name, prefix) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+var helpKeys = [][2]string{
+	{"j/k ↑/↓ g/G", "move in the focused panel"},
+	{"tab shift+tab h/l", "next / previous panel"},
+	{"enter / esc", "vms panel / groups panel"},
+	{"/", "search VM names (enter keep, esc clear)"},
+	{"s", "shell: ssh to the lease IP, else serial console"},
+	{"u / S / r", "start / ACPI shutdown / reboot"},
+	{"F", "force off"},
+	{"P", "pause / resume"},
+	{"a", "toggle autostart on host boot (vms panel)"},
+	{"p", "snapshots: n new, enter revert, d delete"},
+	{"R", "refresh now"},
+	{"?", "this help"},
+	{"q", "quit"},
+	{"", ""},
+	{"", "On the groups panel, u S r F P act on every VM of the"},
+	{"", "group the action applies to, after a y/n prompt."},
+}
+
+// helpView is the ? overlay: every key, centered on an empty screen.
+func (m model) helpView() string {
+	lines := make([]string, 0, len(helpKeys)+2)
+	lines = append(lines, "")
+	for _, k := range helpKeys {
+		lines = append(lines, fmt.Sprintf("  %s  %s", fg(colAccent).Bold(true).Render(fmt.Sprintf("%-17s", k[0])), k[1]))
+	}
+	w := min(m.width, 78)
+	box := panel("help", dim.Render("any key closes"), lines, w, len(lines)+3, colAccent)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
