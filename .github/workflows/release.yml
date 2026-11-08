@@ -1,6 +1,6 @@
 name: release
 
-# Push a vX.Y.Z tag to publish stripped linux binaries. mise installs them
+# Push a vX.Y.Z tag to publish stripped linux and macOS binaries. mise installs them
 # with `"github:konkerama/lazyvirt" = "latest"`.
 on:
   push:
@@ -25,11 +25,12 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir dist
-          for arch in amd64 arm64; do
-            GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o lazyvirt ./cmd/lazyvirt
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*} arch=${target#*/}
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags='-s -w' -o lazyvirt ./cmd/lazyvirt
             # Go stamps the version from the tag; fail rather than ship "(devel)".
-            if [ "$arch" = amd64 ]; then ./lazyvirt --version | grep -Fx "lazyvirt $GITHUB_REF_NAME"; fi
-            tar -czf "dist/lazyvirt_${GITHUB_REF_NAME}_linux_${arch}.tar.gz" lazyvirt README.md
+            if [ "$target" = linux/amd64 ]; then ./lazyvirt --version | grep -Fx "lazyvirt $GITHUB_REF_NAME"; fi
+            tar -czf "dist/lazyvirt_${GITHUB_REF_NAME}_${os}_${arch}.tar.gz" lazyvirt README.md
           done
           (cd dist && sha256sum -- *.tar.gz > checksums.txt)
       - uses: actions/attest-build-provenance@v4

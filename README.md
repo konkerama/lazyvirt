@@ -25,10 +25,15 @@ snapshot or shell into them without leaving the terminal.
 
 ## Install
 
-Prebuilt binaries for linux amd64 and arm64 are on the
-[releases page](https://github.com/konkerama/lazyvirt/releases).
+Prebuilt static binaries for linux and macOS (amd64 and arm64) are on the
+[releases page](https://github.com/konkerama/lazyvirt/releases). Download,
+unpack and put `lazyvirt` on your `PATH`:
 
 ```bash
+# pick linux or darwin, amd64 or arm64
+curl -sL https://github.com/konkerama/lazyvirt/releases/download/v0.1.1/lazyvirt_v0.1.1_linux_amd64.tar.gz | tar xz lazyvirt
+sudo mv lazyvirt /usr/local/bin/
+
 # with mise
 mise use -g github:konkerama/lazyvirt
 
@@ -39,8 +44,12 @@ go install github.com/konkerama/lazyvirt/cmd/lazyvirt@latest
 Each release has a `checksums.txt` and a build provenance attestation:
 
 ```bash
-gh attestation verify lazyvirt_v0.1.0_linux_amd64.tar.gz -R konkerama/lazyvirt
+gh attestation verify lazyvirt_v0.1.1_linux_amd64.tar.gz -R konkerama/lazyvirt
 ```
+
+On macOS there is no local libvirt, so connect to a Linux host:
+`lazyvirt -c qemu+ssh://user@host/system`. The serial console fallback
+needs `virsh` locally (`brew install libvirt`).
 
 ### Requirements
 
